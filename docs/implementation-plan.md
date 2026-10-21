@@ -1,0 +1,33 @@
+# MeMem Cloudflare MCP implementation plan
+
+The service keeps `MemoryStore` and `createMemoryService` as the database boundary. A platform-independent MCP tool layer calls that core; the Cloudflare Worker composes D1, stateless Streamable HTTP, and OAuth 2.1. No model API is used.
+
+## Status
+
+- [x] Confirm project rules, the existing nine core tests, and the `MemoryStore` boundary.
+- [x] Inspect installed Cloudflare Agents MCP v2, the MCP server/client SDKs, OAuth Provider consent helpers, and their type declarations.
+- [x] Implement strict record/search/get/correct/forget tools, per-tool OAuth schemes, annotations, and descriptions that preserve wording, timezones, sources, relationship lookup, and current-vs-historical text behavior.
+- [x] Compose stateless `/mcp` over the existing memory core and D1. Owner and scope data come only from `OAuthResourceContext` after provider validation.
+- [x] Add generated high-entropy owner passphrase, salted verifier, browser-bound explicit consent, same-origin protection, bounded form-body parsing, OAuth discovery, PKCE S256, DCR, resource audience validation, and refresh tokens.
+- [x] Add Wrangler JSON template, D1 migration wiring, separate OAuth KV binding, secret setup and deployment preflight scripts, and ignored mode-0600 local credential files.
+- [x] Add Miniflare D1 + KV integration acceptance with a real MCP protocol client: metadata/DCR/PKCE/refresh, cross-client lookup, CRUD, conflicts, read-only token, invalid audience/verifier, and consent rejection cases.
+- [x] Run TypeScript checks, the original nine core tests, and Worker integration tests; inspect the production Worker bundle against the dependency advisory.
+- [x] Deploy the production Worker and configure the authorized D1/KV bindings.
+- [x] Verify protected-resource metadata returns HTTP 200 and ChatGPT discovers the production endpoint.
+- [x] Run the one-time production acceptance script: OAuth DCR/PKCE/consent, MCP CRUD, second-client reconnection, and test-record cleanup passed.
+- [x] Deploy the consent referrer/CSP fix and verify Chrome OAuth returns to ChatGPT with “Primary is now connected.”
+- [x] Verify real ChatGPT web memory write and cross-conversation search using the configured production connection.
+- [x] Delete the single ChatGPT acceptance fixture using its exact record ID, owner, and marker; D1 reported one deletion and zero matching rows remain.
+- [x] Advertise `memory:read memory:write` in the 401 challenge and protected-resource metadata so Claude custom connectors request write access up front (local tests pass).
+- [x] Deploy that change as version `5cfcee9a-1501-40d9-8b35-be462543309f`; curl confirmed the 401 challenge and resource metadata list `memory:read memory:write`.
+- [x] Verify a Claude custom connector end to end: record, search, get, correct (v1→v2), and forget all succeeded through the connected Claude tools; a marker search afterwards returned zero matches.
+- [x] Translate the consent page and authorization error pages to English (local tests pass).
+- [x] Deploy the English consent page as version `01b77180-dd4e-4f05-9cc4-7514f46bf660`; curl confirmed the English error page and `/mcp` still returns 401 without a token.
+
+## Verification and remaining advisory
+
+`npm run check` and `npm test` pass locally after the consent regression fix. The production dry-run `wrangler deploy --dry-run --env production --outdir /tmp/memem-final-review` also exited successfully before deployment. The production bundle was 1,473.72 KiB (266.35 KiB gzip); its source map had 182 sources and listed neither `@modelcontextprotocol/client` nor `@modelcontextprotocol/sdk`. The dependency tree still reports GHSA-6qxp-vccf-f47h through `agents@0.28.0`'s pinned peer versions (`@modelcontextprotocol/client@2.0.0` and `@modelcontextprotocol/sdk@1.30.0`). The report remains open; the build evidence indicates those client packages are not included in the deployed Worker bundle.
+
+## Deployment status
+
+The parent agent first deployed Worker version `77fe6ade-e499-420b-b57d-6e1f5fda012a` (later superseded by `5cfcee9a-1501-40d9-8b35-be462543309f` for advertised scopes and `01b77180-dd4e-4f05-9cc4-7514f46bf660` for the English consent page) at `https://memem.michaelguan1992.workers.dev` and configured production D1/KV bindings. Protected-resource metadata returned HTTP 200; the production acceptance script passed OAuth DCR/PKCE/consent and MCP create/search/correct/reconnect/delete with test-record cleanup. The deployed consent page uses `Referrer-Policy: same-origin` and limits CSP `form-action` to self plus the origin (including port) from OAuthProvider’s validated redirect URI, while retaining `default-src 'none'` and rejecting null/missing Origin. Chrome OAuth returned to ChatGPT and showed “Primary is now connected.” Real ChatGPT web testing then saved a fictional marked memory in one conversation and found the same record in a separate conversation with the expected related-person, date, and restaurant details. The fixture was then deleted by the parent agent with the owner/ID/marker-scoped SQL command; D1 reported one deletion and zero matching rows. The local deployment-token file was deleted, and Cloudflare confirmed that the deployment token has been revoked. Production deployment and ChatGPT web end-to-end acceptance are complete. iPhone native app and Safari web have not been tested. The implementation agent did not run remote commands or read production credentials.

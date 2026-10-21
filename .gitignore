@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+.dev.vars
+.secrets/
+.owner-passphrase
+.env*
+*.sqlite*
+*.db*
+.DS_Store

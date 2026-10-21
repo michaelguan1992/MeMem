@@ -1,0 +1,56 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "memem",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "memem",
+      "database_id": "00000000000000000000000000000000",
+      "migrations_dir": "migrations/d1"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "11111111111111111111111111111111"
+    }
+  ],
+  "vars": {
+    "APP_ENV": "development",
+    "MCP_RESOURCE_URL": "http://localhost:8787/mcp",
+    "OAUTH_ISSUER": "http://localhost:8787"
+  },
+  "env": {
+    "production": {
+      "name": "memem",
+      "compatibility_date": "2026-10-09",
+      "compatibility_flags": [
+        "nodejs_compat"
+      ],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "memem",
+          "database_id": "ecee4b40-195c-4efb-a52d-710c60bf37e9",
+          "migrations_dir": "migrations/d1"
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "84affc48b82942ee8c9d5243e7650d59"
+        }
+      ],
+      "vars": {
+        "APP_ENV": "production",
+        "MCP_RESOURCE_URL": "https://memem.michaelguan1992.workers.dev/mcp",
+        "OAUTH_ISSUER": "https://memem.michaelguan1992.workers.dev"
+      }
+    }
+  }
+}

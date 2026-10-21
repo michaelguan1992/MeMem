@@ -1,0 +1,35 @@
+{
+  "name": "memem",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "npm run test:core && npm run test:worker",
+    "test:core": "node --test tests/memory.test.ts",
+    "test:worker": "vitest run --config vitest.config.ts",
+    "check": "tsc --noEmit",
+    "demo": "node examples/local.ts",
+    "dev": "wrangler dev",
+    "deploy": "bash scripts/deploy-cloudflare.sh",
+    "acceptance:remote": "node scripts/remote-acceptance.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.3",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.28.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.0",
+    "@cloudflare/workers-types": "^5.20261009.1",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/client-current": "npm:@modelcontextprotocol/client@^2.3.1",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.149.0"
+  }
+}
