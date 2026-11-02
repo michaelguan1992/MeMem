@@ -41,7 +41,7 @@ npm test
 npm run demo
 ```
 
-`npm test` runs the core tests (the nine original memory tests plus the photo service and capture-script tests) and the Worker integration suites under Miniflare: the original OAuth/MCP test, the capture login/session tests, and the `/api` tests, which also write and read real Miniflare R2 objects. The integration test applies the D1 migration to Miniflare's D1 binding, uses its KV binding, and drives OAuth discovery, DCR, PKCE, consent, token and refresh flows, then uses the official MCP client over Streamable HTTP for reads and writes. It covers cross-client lookups, version conflicts, deletion, read-only scopes, bad audiences and PKCE, and rejected consent submissions. Test data exists only in the local test database.
+`npm test` runs every suite through one runner, Vitest, in two projects: `core` in Node and `worker` inside workerd. `npm run coverage` writes one merged `coverage/lcov.info` for both projects. It runs the core tests (the nine original memory tests plus the photo service and capture-script tests) and the Worker integration suites under Miniflare: the original OAuth/MCP test, the capture login/session tests, and the `/api` tests, which also write and read real Miniflare R2 objects. The integration test applies the D1 migration to Miniflare's D1 binding, uses its KV binding, and drives OAuth discovery, DCR, PKCE, consent, token and refresh flows, then uses the official MCP client over Streamable HTTP for reads and writes. It covers cross-client lookups, version conflicts, deletion, read-only scopes, bad audiences and PKCE, and rejected consent submissions. Test data exists only in the local test database.
 
 ## Cloudflare deployment
 

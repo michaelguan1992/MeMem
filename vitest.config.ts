@@ -8,18 +8,41 @@ const digest = createHash('sha256').update(salt).update(testPassphrase, 'utf8').
 const ownerPasswordHash = `sha256-v1$${salt.toString('base64url')}$${digest}`;
 
 export default defineConfig({
-  plugins: [cloudflareTest({
-    main: 'src/worker.ts',
-    wrangler: { configPath: './wrangler.json' },
-    miniflare: {
-      r2Buckets: ['MEDIA'],
-      bindings: {
-        APP_ENV: 'test',
-        MCP_RESOURCE_URL: 'http://localhost:8787/mcp',
-        OAUTH_ISSUER: 'http://localhost:8787',
-        OWNER_PASSWORD_HASH: ownerPasswordHash,
-      },
+  test: {
+    coverage: {
+      provider: 'v8',
+      reporter: ['text-summary', 'lcov'],
+      reportsDirectory: 'coverage',
+      include: ['src/**/*.ts'],
     },
-  })],
-  test: { include: ['tests/worker.integration.test.ts', 'tests/capture.integration.test.ts', 'tests/api.integration.test.ts'], testTimeout: 30_000, hookTimeout: 30_000 },
+    projects: [
+      {
+        test: {
+          name: 'core',
+          include: ['tests/memory.test.ts', 'tests/media.test.ts', 'tests/capture-client.test.ts'],
+        },
+      },
+      {
+        plugins: [cloudflareTest({
+          main: 'src/worker.ts',
+          wrangler: { configPath: './wrangler.json' },
+          miniflare: {
+            r2Buckets: ['MEDIA'],
+            bindings: {
+              APP_ENV: 'test',
+              MCP_RESOURCE_URL: 'http://localhost:8787/mcp',
+              OAUTH_ISSUER: 'http://localhost:8787',
+              OWNER_PASSWORD_HASH: ownerPasswordHash,
+            },
+          },
+        })],
+        test: {
+          name: 'worker',
+          include: ['tests/worker.integration.test.ts', 'tests/capture.integration.test.ts', 'tests/api.integration.test.ts'],
+          testTimeout: 30_000,
+          hookTimeout: 30_000,
+        },
+      },
+    ],
+  },
 });

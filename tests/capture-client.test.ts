@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { captureScript } from '../src/platform/capture-client.ts';
 import { readJpegTakenAt } from '../src/platform/exif.ts';
