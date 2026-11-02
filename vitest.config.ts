@@ -12,6 +12,7 @@ export default defineConfig({
     main: 'src/worker.ts',
     wrangler: { configPath: './wrangler.json' },
     miniflare: {
+      r2Buckets: ['MEDIA'],
       bindings: {
         APP_ENV: 'test',
         MCP_RESOURCE_URL: 'http://localhost:8787/mcp',
@@ -20,5 +21,5 @@ export default defineConfig({
       },
     },
   })],
-  test: { include: ['tests/worker.integration.test.ts'], testTimeout: 30_000, hookTimeout: 30_000 },
+  test: { include: ['tests/worker.integration.test.ts', 'tests/capture.integration.test.ts', 'tests/api.integration.test.ts'], testTimeout: 30_000, hookTimeout: 30_000 },
 });

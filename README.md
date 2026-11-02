@@ -6,11 +6,12 @@ The Worker and full OAuth/MCP flow are covered by local Miniflare integration te
 
 ## Components
 
-- `src/core/` contains the platform-independent memory rules and `MemoryStore` interface.
-- `src/storage/` contains local SQLite and D1 adapters.
+- `src/core/` contains the platform-independent memory rules and `MemoryStore` interface, plus the photo rules in `media.ts` behind separate `MediaStore` and `BlobStore` interfaces.
+- `src/storage/` contains local SQLite and D1 adapters for memories and photo metadata.
+- `src/platform/` composes the core for Cloudflare: the R2 photo store, the `/capture` web page and its owner-passphrase session, and the session-protected `/api/*` JSON and upload endpoints.
 - `src/mcp/tools.ts` defines strict `record_memory`, `search_memories`, `get_memory`, `correct_memory`, and `forget_memory` tools.
 - `src/worker.ts` serves stateless Streamable HTTP at `/mcp` and OAuth 2.1 authorization, discovery, refresh, and dynamic client registration through the official Cloudflare OAuth provider.
-- D1 stores memory records. The separate `OAUTH_KV` binding stores OAuth clients, grants, consent handles, and tokens.
+- D1 stores memory records, photo metadata, and hashed web sessions. The private R2 binding `MEDIA` stores photo files (original plus browser-generated display and thumbnail copies). The separate `OAUTH_KV` binding stores OAuth clients, grants, consent handles, and tokens.
 
 The authenticated owner identity comes from the OAuth provider's verified context. MCP tool arguments cannot choose a user or owner. Read-only tools require `memory:read`; record, correct, and forget require both `memory:read` and `memory:write`. OAuth access tokens last one hour and refresh tokens last 30 days.
 
@@ -26,7 +27,11 @@ npm run dev
 
 The setup script generates a 256-bit owner passphrase. It saves the passphrase to `.secrets/owner-passphrase`, its salted verifier to `.secrets/owner-password-hash`, and the local Worker binding to `.dev.vars`. The script does not print either credential. The `.secrets` directory uses mode `0700`; each credential file uses mode `0600`. Keep the passphrase in a password manager and open the local file when you need to enter it in MeMem's authorization page. Never paste the passphrase into an AI conversation.
 
-`npm run dev` uses local Miniflare D1 and KV bindings. The local D1 migration is `migrations/d1/0001_memories.sql`; the local resource URL is `http://localhost:8787/mcp`. Loopback HTTP is accepted only for local development.
+`npm run dev` uses local Miniflare D1, KV, and R2 bindings. Apply the local D1 migrations (`0001_memories.sql`, `0002_media.sql`) with `npx wrangler d1 migrations apply memem --local`; the local resource URL is `http://localhost:8787/mcp`. Loopback HTTP is accepted only for local development.
+
+## Photo diary capture (local only, not deployed)
+
+Open `http://localhost:8787/capture`, sign in with the owner passphrase, write what happened, pick photos and related people or places, and save. The browser reads the JPEG EXIF capture time to prefill the date, creates display (1600 px) and thumbnail (400 px) JPEG copies, and uploads each photo with its SHA-256; the Worker checks the file type by magic bytes, size limits, and the hash, and skips duplicates. Sessions last seven days in a `__Host-` HttpOnly SameSite=Strict cookie; every write needs a same-origin request and a CSRF token. Deleting a memory unlinks its photos without deleting them. The page has a web app manifest so it can be added to a phone's home screen. Design: `docs/diary-recall-design.md`.
 
 ## Checks
 
@@ -36,7 +41,7 @@ npm test
 npm run demo
 ```
 
-`npm test` runs all nine existing core tests and a real Worker integration test under Miniflare. The integration test applies the D1 migration to Miniflare's D1 binding, uses its KV binding, and drives OAuth discovery, DCR, PKCE, consent, token and refresh flows, then uses the official MCP client over Streamable HTTP for reads and writes. It covers cross-client lookups, version conflicts, deletion, read-only scopes, bad audiences and PKCE, and rejected consent submissions. Test data exists only in the local test database.
+`npm test` runs the core tests (the nine original memory tests plus the photo service and capture-script tests) and the Worker integration suites under Miniflare: the original OAuth/MCP test, the capture login/session tests, and the `/api` tests, which also write and read real Miniflare R2 objects. The integration test applies the D1 migration to Miniflare's D1 binding, uses its KV binding, and drives OAuth discovery, DCR, PKCE, consent, token and refresh flows, then uses the official MCP client over Streamable HTTP for reads and writes. It covers cross-client lookups, version conflicts, deletion, read-only scopes, bad audiences and PKCE, and rejected consent submissions. Test data exists only in the local test database.
 
 ## Cloudflare deployment
 

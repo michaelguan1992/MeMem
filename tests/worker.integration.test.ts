@@ -2,6 +2,7 @@ import { test, expect } from 'vitest';
 import { env, SELF } from 'cloudflare:test';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client-current';
 import schemaSql from '../migrations/d1/0001_memories.sql?raw';
+import mediaSql from '../migrations/d1/0002_media.sql?raw';
 
 const origin = 'http://localhost:8787';
 const resource = `${origin}/mcp`;
@@ -109,7 +110,8 @@ async function call<T extends JSONRecord>(client: Client, name: string, args: JS
 }
 
 test('OAuth discovery, DCR, PKCE, refresh and Streamable HTTP MCP CRUD run against Miniflare D1 + KV', async () => {
-  for (const statement of schemaSql.split(';').map((part) => part.trim()).filter(Boolean)) {
+  // Production applies every migration; forget_memory also unlinks photos in the media table.
+  for (const statement of `${schemaSql};${mediaSql}`.split(';').map((part) => part.trim()).filter(Boolean)) {
     await env.DB.prepare(statement).run();
   }
 

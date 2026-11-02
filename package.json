@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "npm run test:core && npm run test:worker",
-    "test:core": "node --test tests/memory.test.ts",
+    "test:core": "node --test tests/memory.test.ts tests/media.test.ts tests/capture-client.test.ts",
     "test:worker": "vitest run --config vitest.config.ts",
     "check": "tsc --noEmit",
     "demo": "node examples/local.ts",

@@ -24,6 +24,19 @@ The service keeps `MemoryStore` and `createMemoryService` as the database bounda
 - [x] Translate the consent page and authorization error pages to English (local tests pass).
 - [x] Deploy the English consent page as version `01b77180-dd4e-4f05-9cc4-7514f46bf660`; curl confirmed the English error page and `/mcp` still returns 401 without a token.
 
+## Next: diary and recall
+
+Design: `docs/diary-recall-design.md`. Implementation followed AGENTS.md roles: the main agent split Phase 1 into four bounded briefs, each implemented by a Claude Haiku subagent (effort=max) and reviewed before the next.
+
+- [x] Phase 1, task 1: `MediaStore`/`BlobStore` contracts, `0002_media.sql` (media + web_sessions), core photo service (magic-byte type check, size limits, SHA-256 verification, per-owner dedup, blob cleanup on failure, CAS edits, unlink), D1 and R2 adapters, core tests.
+- [x] Phase 1, task 2: `/capture` owner-passphrase login with hashed D1 sessions, `__Host-` HttpOnly SameSite=Strict cookie, CSRF token, logout.
+- [x] Phase 1, task 3: session-protected `/api/entries`, `/api/related`, `/api/media` upload/list/patch/delete/read; deleting a memory (including via MCP `forget_memory`) unlinks its photos best-effort.
+- [x] Phase 1, task 4: capture page, browser EXIF time prefill, client-side display/thumbnail generation, per-photo status and retry, web app manifest, strict CSP.
+- [x] Local checks: `npm run check` passes; `npm test` passes (43 core tests, 24 Worker integration tests across 3 files).
+- [x] Local browser check against `wrangler dev` (Miniflare D1/R2): sign-in, entry creation, photo upload, all three R2 variants read back with correct sizes, mobile/dark layout, logout. This found and fixed a bug the integration tests missed: `Referrer-Policy: no-referrer` made the browser send `Origin: null`, so the capture pages now use `same-origin`.
+- [ ] Not verified: iPhone Safari/home-screen install, HEIC photos, real EXIF photos in a browser, large photos' memory use. Not deployed: needs the R2 bucket `memem-media`, an R2 permission on the deployment token, the `0002` migration, and a decision on login rate limiting.
+- [ ] Phase 2: recall pages and MCP tools (`list_media`, `create_recall`, …).
+
 ## Verification and remaining advisory
 
 `npm run check` and `npm test` pass locally after the consent regression fix. The production dry-run `wrangler deploy --dry-run --env production --outdir /tmp/memem-final-review` also exited successfully before deployment. The production bundle was 1,473.72 KiB (266.35 KiB gzip); its source map had 182 sources and listed neither `@modelcontextprotocol/client` nor `@modelcontextprotocol/sdk`. The dependency tree still reports GHSA-6qxp-vccf-f47h through `agents@0.28.0`'s pinned peer versions (`@modelcontextprotocol/client@2.0.0` and `@modelcontextprotocol/sdk@1.30.0`). The report remains open; the build evidence indicates those client packages are not included in the deployed Worker bundle.

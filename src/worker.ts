@@ -3,6 +3,11 @@ import type { AuthInfo } from '@modelcontextprotocol/server';
 import { AuthorizationError, CimdFetchError, OAuthProvider, type OAuthHelpers, type OAuthResourceContext } from '@cloudflare/workers-oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 import { createCloudflareMemory } from './platform/cloudflare.ts';
+import { htmlEscape, PayloadTooLargeError, readBoundedForm, sameOriginPost } from './platform/http.ts';
+import { verifyOwnerPassword } from './platform/owner-password.ts';
+import type { R2Binding } from './platform/r2.ts';
+import { handleCapture } from './platform/web-capture.ts';
+import { handleApi } from './platform/web-api.ts';
 import { createMemoryMcpServer, MEMORY_READ_SCOPE, MEMORY_WRITE_SCOPE } from './mcp/tools.ts';
 import type { D1Binding } from './storage/d1.ts';
 
@@ -11,6 +16,7 @@ const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 interface WorkerEnv {
   DB: D1Binding;
+  MEDIA: R2Binding;
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
   OWNER_PASSWORD_HASH: string;
@@ -19,7 +25,6 @@ interface WorkerEnv {
   APP_ENV?: string;
 }
 
-const htmlEscape = (value: string): string => value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 const pageHeaders = {
   'Content-Type': 'text/html; charset=utf-8',
   'Cache-Control': 'no-store',
@@ -53,34 +58,6 @@ function consentPage(details: Awaited<ReturnType<OAuthHelpers['describeConsent']
     : '';
   return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Connect MeMem</title><h1>Connect MeMem</h1><p><strong>${htmlEscape(details.clientName)}</strong> is requesting access to your personal memories.</p><p>Authorization will be sent to: <strong>${htmlEscape(details.redirectHost)}</strong></p>${details.clientDomain ? `<p>Client website: <strong>${htmlEscape(details.clientDomain)}</strong></p>` : '<p>The client name is self-reported and its publisher has not been verified.</p>'}${redirectNotice}<p>Choose the permissions to allow:</p><form method="post" action="/authorize"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopes}<p><label>Owner passphrase: <input type="password" name="password" autocomplete="current-password" required></label></p>${errorMessage ? `<p role="alert">${htmlEscape(errorMessage)}</p>` : ''}<p><button name="decision" value="approve">Allow and connect</button> <button name="decision" value="deny" formnovalidate>Deny</button></p></form></html>`;
 }
-function base64UrlToBytes(value: string): Uint8Array {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  const binary = atob(normalized + '='.repeat((4 - normalized.length % 4) % 4));
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
-  let difference = left.length ^ right.length;
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index++) difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
-  return difference === 0;
-}
-async function verifyOwnerPassword(password: string, storedHash: string): Promise<boolean> {
-  const [version, saltPart, digestPart, extra] = storedHash.split('$');
-  if (version !== 'sha256-v1' || !saltPart || !digestPart || extra !== undefined || password.length > 512) return false;
-  let salt: Uint8Array;
-  let expected: Uint8Array;
-  try {
-    salt = base64UrlToBytes(saltPart);
-    expected = base64UrlToBytes(digestPart);
-  } catch { return false; }
-  if (salt.length !== 16 || expected.length !== 32) return false;
-  const passwordBytes = new TextEncoder().encode(password);
-  const combined = new Uint8Array(salt.length + passwordBytes.length);
-  combined.set(salt);
-  combined.set(passwordBytes, salt.length);
-  const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));
-  return constantTimeEqual(actual, expected);
-}
 function isSecureRequest(request: Request, _env: WorkerEnv): boolean {
   const url = new URL(request.url);
   return url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname));
@@ -92,41 +69,13 @@ function authErrorResponse(error: unknown): Response {
   }
   return page('The authorization service is temporarily unavailable. Please try again later.', 503);
 }
-class PayloadTooLargeError extends Error {}
-async function readBoundedForm(request: Request, maximumBytes: number): Promise<URLSearchParams> {
-  const type = request.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
-  if (type !== 'application/x-www-form-urlencoded') throw new Error('Expected URL-encoded form data');
-  const declaredLength = Number(request.headers.get('Content-Length'));
-  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) throw new PayloadTooLargeError();
-  const reader = request.body?.getReader();
-  if (!reader) return new URLSearchParams();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maximumBytes) {
-        await reader.cancel();
-        throw new PayloadTooLargeError();
-      }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-  return new URLSearchParams(new TextDecoder().decode(body));
-}
-function sameOriginPost(request: Request): boolean {
-  const origin = request.headers.get('Origin');
-  return Boolean(origin && origin === new URL(request.url).origin);
-}
-
 const defaultHandler = {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     if (!isSecureRequest(request, env)) return page('Production authorization requires HTTPS.', 403);
+    const capture = await handleCapture(request, env, OWNER_ID);
+    if (capture) return capture;
+    const api = await handleApi(request, env, OWNER_ID);
+    if (api) return api;
     if (new URL(request.url).pathname !== '/authorize') return new Response('Not found', { status: 404 });
     if (request.method === 'GET') {
       try {

@@ -20,6 +20,12 @@
       "id": "11111111111111111111111111111111"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "memem-media-dev"
+    }
+  ],
   "vars": {
     "APP_ENV": "development",
     "MCP_RESOURCE_URL": "http://localhost:8787/mcp",
@@ -44,6 +50,12 @@
         {
           "binding": "OAUTH_KV",
           "id": "84affc48b82942ee8c9d5243e7650d59"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "MEDIA",
+          "bucket_name": "memem-media"
         }
       ],
       "vars": {
