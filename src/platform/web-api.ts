@@ -1,8 +1,11 @@
-import type { MemoryInput } from '../core/contracts.ts';
+import { z } from 'zod';
+import { sha256Hex } from '../core/media.ts';
 import { MemoryError } from '../core/errors.ts';
-import type { MediaEdit, MediaVariant } from '../core/media.ts';
+import {
+  mediaEditFields, mediaIdSchema, mediaVariantSchema, MAX_PAGE_LIMIT, MEDIA_VARIANTS, memoryFields, memoryIdSchema, parse,
+  relatedIdList, versionSchema, type MediaVariant,
+} from '../core/schema.ts';
 import { currentMemory } from '../core/service.ts';
-import { toHex } from '../core/validate.ts';
 import type { D1Binding } from '../storage/d1.ts';
 import { createCloudflareMedia, createCloudflareMemory } from './cloudflare.ts';
 import { PayloadTooLargeError, readBoundedBytes, sameOriginPost } from './http.ts';
@@ -12,14 +15,13 @@ import { checkCsrf, readSession } from './web-session.ts';
 type ApiEnv = { DB: D1Binding; MEDIA: R2Binding };
 type MemoryService = ReturnType<typeof createCloudflareMemory>;
 type MediaService = ReturnType<typeof createCloudflareMedia>;
-type JsonObject = Record<string, unknown>;
 
 const MiB = 1024 * 1024;
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_UPLOAD_BYTES = 32 * MiB;
 const MEDIA_PAGE = 50;
-const RELATED_PAGE = 200;
 const SUMMARY_CHARS = 200;
+const variantPath = new RegExp(`^/api/media/([^/]+)/(${MEDIA_VARIANTS.join('|')})$`);
 const jsonHeaders = {
   'Content-Type': 'application/json; charset=utf-8',
   'Cache-Control': 'no-store',
@@ -57,50 +59,69 @@ function parseJson(bytes: Uint8Array): unknown {
   try { return JSON.parse(new TextDecoder().decode(bytes)); }
   catch { throw bad('Request body must be valid JSON'); }
 }
-/** Accepts only the listed keys; every field is type-checked again by the core service. */
-async function jsonBody(request: Request, allowed: string[]): Promise<JsonObject> {
+
+// A JSON body is a strict object of the core fields it names. Unknown keys and non-objects are refused with the
+// messages this API has always returned; a wrong value is refused with the message of the rule it breaks.
+const UNKNOWN_FIELD = 'Request body has an unknown field';
+const NOT_AN_OBJECT = 'Request body must be a JSON object';
+const jsonObject = <Shape extends z.ZodRawShape>(shape: Shape) => z.strictObject(shape, {
+  error: (issue) => (issue.code === 'unrecognized_keys' ? UNKNOWN_FIELD : NOT_AN_OBJECT),
+});
+const entryBody = jsonObject({
+  id: memoryIdSchema.optional(),
+  text: memoryFields.text,
+  occurredAt: memoryFields.occurredAt,
+  // The capture page never sends null here, but null has always meant "no links" on this endpoint.
+  relatedIds: relatedIdList.nullish(),
+});
+const mediaEditBody = jsonObject({ expectedVersion: versionSchema, ...mediaEditFields });
+const expectedVersionBody = jsonObject({ expectedVersion: versionSchema });
+
+async function jsonBody<Schema extends z.ZodType>(request: Request, schema: Schema): Promise<z.output<Schema>> {
   if (mediaType(request) !== 'application/json') throw new HttpError(415, 'unsupported_media_type', 'Expected application/json');
-  const body = parseJson(await readBoundedBytes(request, MAX_JSON_BYTES));
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('Request body must be a JSON object');
-  if (Object.keys(body).some((key) => !allowed.includes(key))) throw bad('Request body has an unknown field');
-  return body as JsonObject;
+  return parse(schema, parseJson(await readBoundedBytes(request, MAX_JSON_BYTES)));
 }
 async function multipart(request: Request): Promise<FormData> {
   if (mediaType(request) !== 'multipart/form-data') throw new HttpError(415, 'unsupported_media_type', 'Expected multipart/form-data');
   try { return await request.formData(); }
   catch { throw bad('Invalid multipart form data'); }
 }
-function textField(form: FormData, name: string): string | undefined {
-  const value = form.get(name);
-  if (value === null || value === '') return undefined;
-  if (typeof value !== 'string') throw bad(`${name} must be text`);
-  return value;
-}
-function integer(form: FormData, name: string): number | undefined {
-  const value = textField(form, name);
-  if (value === undefined) return undefined;
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw bad(`${name} must be a decimal integer`);
-  return Number(value);
-}
-async function optionalFile(form: FormData, name: string): Promise<Uint8Array<ArrayBuffer> | undefined> {
-  const value = form.get(name);
-  // A browser sends an empty file part for an untouched file input; treat it as absent.
-  if (value === null || value === '' || (value instanceof File && value.size === 0)) return undefined;
-  if (!(value instanceof File)) throw bad(`${name} must be a file`);
-  return new Uint8Array(await value.arrayBuffer());
-}
+
+// Form fields. An empty field is absent, and a browser sends an empty file part for an untouched file input.
+const absentText = (value: unknown) => (value === null || value === '' ? undefined : value);
+const absentFile = (value: unknown) => (value === null || value === '' || (value instanceof File && value.size === 0) ? undefined : value);
+const textField = (name: string) => z.preprocess(absentText, z.string({ error: `${name} must be text` }).optional());
+const fileField = (name: string) => z.preprocess(absentFile, z.instanceof(File, { error: `${name} must be a file` }).optional());
+const integerField = (name: string) => z.preprocess(absentText, z.string({ error: `${name} must be text` })
+  .regex(/^\d+$/, { error: `${name} must be a decimal integer` })
+  .refine((text) => Number.isSafeInteger(Number(text)), { error: `${name} must be a decimal integer` })
+  .transform(Number)
+  .optional());
+const uploadFields = {
+  original: z.instanceof(File, { error: 'original must be an uploaded photo' }),
+  display: fileField('display'),
+  thumb: fileField('thumb'),
+  sha256: textField('sha256'),
+  takenAt: textField('takenAt'),
+  width: integerField('width'),
+  height: integerField('height'),
+  caption: textField('caption'),
+  memoryId: textField('memoryId'),
+};
+const uploadForm = z.object(uploadFields);
+const bytesOf = async (file: File): Promise<Uint8Array<ArrayBuffer>> => new Uint8Array(await file.arrayBuffer());
 
 async function createEntry(request: Request, memories: MemoryService): Promise<Response> {
-  const { id, text, occurredAt, relatedIds } = await jsonBody(request, ['id', 'text', 'occurredAt', 'relatedIds']);
+  const { id, relatedIds, ...entry } = await jsonBody(request, entryBody);
   // The client-chosen id is checked by the core service; a retry with the same id replays the entry.
-  const memory = await memories.record({ kind: 'event', text, occurredAt, relatedIds } as MemoryInput, id as string | undefined);
+  const memory = await memories.record({ kind: 'event', ...entry, relatedIds: relatedIds ?? undefined }, id);
   return ok({ memory: currentMemory(memory) }, 201);
 }
 async function relatedPeople(url: URL, memories: MemoryService): Promise<Response> {
-  const page = await memories.search({ afterId: url.searchParams.get('afterId') || undefined, limit: RELATED_PAGE });
+  const page = await memories.search({ afterId: url.searchParams.get('afterId') || undefined, limit: MAX_PAGE_LIMIT });
   const items = page.filter((memory) => memory.kind === 'person' || memory.kind === 'place')
     .map((memory) => ({ id: memory.id, kind: memory.kind, text: [...memory.text].slice(0, SUMMARY_CHARS).join('') }));
-  return ok({ items, nextAfterId: page.length === RELATED_PAGE ? page[page.length - 1].id : null });
+  return ok({ items, nextAfterId: page.length === MAX_PAGE_LIMIT ? page[page.length - 1].id : null });
 }
 async function listMedia(url: URL, media: MediaService): Promise<Response> {
   const items = await media.list({
@@ -118,30 +139,26 @@ async function uploadMedia(request: Request, media: MediaService): Promise<Respo
     throw new HttpError(413, 'payload_too_large', 'Uploads must declare a Content-Length of at most 32 MiB');
   }
   const form = await multipart(request);
-  const original = form.get('original');
-  if (!(original instanceof File)) throw bad('original must be an uploaded photo');
-  const originalBytes = new Uint8Array(await original.arrayBuffer());
+  // Only the names in uploadFields are read from the form.
+  const fields = parse(uploadForm, Object.fromEntries(Object.keys(uploadFields).map((name) => [name, form.get(name)])));
+  const original = await bytesOf(fields.original);
+  const display = fields.display === undefined ? undefined : await bytesOf(fields.display);
+  const thumb = fields.thumb === undefined ? undefined : await bytesOf(fields.thumb);
   const result = await media.upload({
-    original: originalBytes,
-    display: await optionalFile(form, 'display'),
-    thumb: await optionalFile(form, 'thumb'),
-    sha256: textField(form, 'sha256') ?? toHex(await crypto.subtle.digest('SHA-256', originalBytes)),
-    takenAt: textField(form, 'takenAt'),
-    width: integer(form, 'width'),
-    height: integer(form, 'height'),
-    caption: textField(form, 'caption'),
-    memoryId: textField(form, 'memoryId'),
+    original, display, thumb,
+    sha256: fields.sha256 ?? await sha256Hex(original),
+    takenAt: fields.takenAt, width: fields.width, height: fields.height, caption: fields.caption, memoryId: fields.memoryId,
   });
   return ok({ media: result.media, duplicate: result.duplicate }, result.duplicate ? 200 : 201);
 }
 async function updateMedia(request: Request, media: MediaService, id: string): Promise<Response> {
-  const { expectedVersion, memoryId, caption } = await jsonBody(request, ['expectedVersion', 'memoryId', 'caption']);
-  const updated = await media.update(id, expectedVersion as number, { memoryId, caption } as MediaEdit);
+  const { expectedVersion, memoryId, caption } = await jsonBody(request, mediaEditBody);
+  const updated = await media.update(id, expectedVersion, { memoryId, caption });
   return ok({ media: updated });
 }
 async function deleteMedia(request: Request, media: MediaService, id: string): Promise<Response> {
-  const { expectedVersion } = await jsonBody(request, ['expectedVersion']);
-  await media.remove(id, expectedVersion as number);
+  const { expectedVersion } = await jsonBody(request, expectedVersionBody);
+  await media.remove(id, expectedVersion);
   return ok({ deleted: true, id });
 }
 async function readMedia(media: MediaService, id: string, variant: MediaVariant): Promise<Response> {
@@ -178,11 +195,15 @@ async function dispatch(request: Request, env: ApiEnv, owner: string): Promise<R
   }
   const item = /^\/api\/media\/([^/]+)$/.exec(pathname);
   if (item) {
-    if (method === 'PATCH') return updateMedia(request, media, item[1]);
-    return method === 'DELETE' ? deleteMedia(request, media, item[1]) : notAllowed('PATCH, DELETE');
+    if (method === 'PATCH') return updateMedia(request, media, parse(mediaIdSchema, item[1]));
+    return method === 'DELETE' ? deleteMedia(request, media, parse(mediaIdSchema, item[1])) : notAllowed('PATCH, DELETE');
   }
-  const variant = /^\/api\/media\/([^/]+)\/(original|display|thumb)$/.exec(pathname);
-  if (variant) return method === 'GET' ? readMedia(media, variant[1], variant[2] as MediaVariant) : notAllowed('GET');
+  const variant = variantPath.exec(pathname);
+  if (variant) {
+    return method === 'GET'
+      ? readMedia(media, parse(mediaIdSchema, variant[1]), parse(mediaVariantSchema, variant[2]))
+      : notAllowed('GET');
+  }
   return fail(404, 'not_found', 'Not found');
 }
 

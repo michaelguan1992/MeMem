@@ -1,4 +1,9 @@
+import { z } from 'zod';
 import type { Media, MediaStore } from '../core/contracts.ts';
+import {
+  captionSchema, DEFAULT_PAGE_LIMIT, dimensionSchema, instantSchema, mediaIdSchema, memoryIdSchema, originalBytesSchema, parseStored,
+  photoContentTypeSchema, sha256Schema, versionSchema,
+} from '../core/schema.ts';
 import type { SqlDriver } from './sql-store.ts';
 
 /** SQLite-family implementation detail; same SQL as the media table in migrations/d1/0002_media.sql. */
@@ -18,13 +23,17 @@ CREATE INDEX IF NOT EXISTS media_memory ON media(owner, memory_id);
 CREATE UNIQUE INDEX IF NOT EXISTS media_hash ON media(owner, sha256);`;
 
 const columns = 'id, memory_id, content_type, bytes, sha256, taken_at, width, height, caption, created_at, version';
+// A row that does not match these rules is corrupt storage; it is never returned as a photo.
+const storedRow = z.object({
+  id: mediaIdSchema, memory_id: memoryIdSchema.nullable(), content_type: photoContentTypeSchema, bytes: originalBytesSchema,
+  sha256: sha256Schema, taken_at: instantSchema.nullable(), width: dimensionSchema.nullable(), height: dimensionSchema.nullable(),
+  caption: captionSchema.nullable(), created_at: instantSchema, version: versionSchema,
+}).transform((row): Media => ({
+  id: row.id, memoryId: row.memory_id, contentType: row.content_type, bytes: row.bytes, sha256: row.sha256, takenAt: row.taken_at,
+  width: row.width, height: row.height, caption: row.caption, createdAt: row.created_at, version: row.version,
+}));
 function decode(row: Record<string, unknown>): Media {
-  return {
-    id: row.id as string, memoryId: row.memory_id as string | null, contentType: row.content_type as Media['contentType'],
-    bytes: row.bytes as number, sha256: row.sha256 as string, takenAt: row.taken_at as string | null,
-    width: row.width as number | null, height: row.height as number | null, caption: row.caption as string | null,
-    createdAt: row.created_at as string, version: row.version as number,
-  };
+  return parseStored(storedRow, row, 'media row');
 }
 
 export function createSqlMediaStore(driver: SqlDriver): MediaStore {
@@ -40,7 +49,7 @@ export function createSqlMediaStore(driver: SqlDriver): MediaStore {
       else if (query.memoryId !== undefined) { where.push('memory_id = ?'); args.push(query.memoryId); }
       if (query.sha256 !== undefined) { where.push('sha256 = ?'); args.push(query.sha256); }
       if (query.afterId !== undefined) { where.push('id > ?'); args.push(query.afterId); }
-      args.push(query.limit ?? 50);
+      args.push(query.limit ?? DEFAULT_PAGE_LIMIT);
       return (await driver.query(`SELECT ${columns} FROM media WHERE ${where.join(' AND ')} ORDER BY id LIMIT ?`, args)).map(decode);
     },
     async save(owner, media, expectedVersion) {

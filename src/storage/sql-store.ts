@@ -1,4 +1,6 @@
+import { z } from 'zod';
 import type { Memory, MemoryQuery, MemoryStore } from '../core/contracts.ts';
+import { DEFAULT_PAGE_LIMIT, instantSchema, memoryIdSchema, memoryKindSchema, memoryTextSchema, parseStored, relatedIdList, versionSchema } from '../core/schema.ts';
 
 /** SQLite-family implementation detail, NOT the interface new databases must implement. */
 export interface SqlDriver {
@@ -11,7 +13,20 @@ export const schema = `CREATE TABLE IF NOT EXISTS memories (
   PRIMARY KEY (owner, id)
 );
 CREATE INDEX IF NOT EXISTS memories_time ON memories(owner, occurred_at);`;
-function decode(row: Record<string, unknown>): Memory { return JSON.parse(row.payload as string); }
+
+// The payload is the JSON of a Memory, written in this key order. A row that does not match is corrupt storage.
+const storedPayload = z.object({
+  kind: memoryKindSchema, text: memoryTextSchema, occurredAt: instantSchema.nullable(), relatedIds: relatedIdList,
+  id: memoryIdSchema, originalText: memoryTextSchema, createdAt: instantSchema, updatedAt: instantSchema, version: versionSchema,
+});
+const payloadRow = z.object({ payload: z.string() });
+function decode(row: Record<string, unknown>): Memory {
+  const { payload } = parseStored(payloadRow, row, 'memory row');
+  let value: unknown;
+  try { value = JSON.parse(payload); }
+  catch { throw new Error('Corrupt memory payload in storage: not JSON'); }
+  return parseStored(storedPayload, value, 'memory payload');
+}
 
 export function createSqlStore(driver: SqlDriver): MemoryStore {
   return {
@@ -32,7 +47,7 @@ export function createSqlStore(driver: SqlDriver): MemoryStore {
       if (query.from) { where.push('occurred_at >= ?'); args.push(query.from); }
       if (query.before) { where.push('occurred_at < ?'); args.push(query.before); }
       if (query.afterId) { where.push('id > ?'); args.push(query.afterId); }
-      args.push(query.limit ?? 50);
+      args.push(query.limit ?? DEFAULT_PAGE_LIMIT);
       return (await driver.query(`SELECT payload FROM memories WHERE ${where.join(' AND ')} ORDER BY id LIMIT ?`, args)).map(decode);
     },
     async save(owner, memory, expectedVersion) {

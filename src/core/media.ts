@@ -1,74 +1,32 @@
 import type { BlobObject, BlobStore, Media, MediaQuery, MediaStore, MemoryStore } from './contracts.ts';
-import { MemoryError } from './errors.ts';
-import { digest, identifier, instant, invalid, toHex, version } from './validate.ts';
+import { MemoryError, invalid } from './errors.ts';
+import {
+  FIRST_VERSION, instantSchema, MAX_PAGE_LIMIT, mediaEdit, mediaIdSchema, mediaQuery, mediaUpload, mediaVariantSchema, memoryIdSchema,
+  MEDIA_VARIANTS, parse, versionSchema, type MediaEdit, type MediaId, type MediaQueryInput, type MediaUpload, type MediaVariant,
+  type MemoryId, type PhotoContentType, type Sha256,
+} from './schema.ts';
 
-export interface MediaUpload {
-  original: Uint8Array<ArrayBuffer>;
-  display?: Uint8Array<ArrayBuffer>;
-  thumb?: Uint8Array<ArrayBuffer>;
-  sha256: string;
-  takenAt?: string | null;
-  width?: number | null;
-  height?: number | null;
-  caption?: string | null;
-  memoryId?: string | null;
-}
-/** Both fields are required on every edit; null clears a field. */
-export interface MediaEdit {
-  memoryId: string | null;
-  caption: string | null;
-}
-export type MediaVariant = 'original' | 'display' | 'thumb';
-
-const MiB = 1024 * 1024;
-const variants: MediaVariant[] = ['original', 'display', 'thumb'];
-const originalTypes: Media['contentType'][] = ['image/jpeg', 'image/heic', 'image/png', 'image/webp'];
-const derivedTypes: Media['contentType'][] = ['image/jpeg', 'image/webp'];
-const heifBrands = new Set(['heic', 'heix', 'mif1', 'msf1', 'hevc']);
-
-function dimension(value: unknown): number | null {
-  if (value == null) return null;
-  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100000) invalid('Dimensions must be integers from 1 to 100000');
-  return value as number;
-}
-function caption(value: unknown): string | null {
-  if (value == null) return null;
-  if (typeof value !== 'string' || value.length > 2000) invalid('Caption must be at most 2000 characters');
-  return value as string;
-}
-/** Type comes from magic bytes only; client-supplied MIME types are never trusted. */
-function sniff(bytes: Uint8Array): Media['contentType'] | null {
-  const at = (offset: number, text: string) => [...text].every((char, i) => bytes[offset + i] === char.charCodeAt(0));
-  if (at(0, '\xff\xd8\xff')) return 'image/jpeg';
-  if (at(0, '\x89PNG\r\n\x1a\n')) return 'image/png';
-  if (at(0, 'RIFF') && at(8, 'WEBP')) return 'image/webp';
-  if (at(4, 'ftyp') && heifBrands.has(String.fromCharCode(...bytes.subarray(8, 12)))) return 'image/heic';
-  return null;
-}
-function photo(value: unknown, max: number, label: string, types: Media['contentType'][]): Media['contentType'] {
-  if (!(value instanceof Uint8Array) || value.byteLength < 1 || value.byteLength > max) invalid(`${label} must be 1 byte to ${max / MiB} MiB`);
-  const type = sniff(value as Uint8Array);
-  if (!type || !types.includes(type)) invalid(`${label} has an unsupported format`);
-  return type as Media['contentType'];
+/** Lowercase hex SHA-256 of the bytes, the form the schema accepts for a photo's digest. */
+export async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; memories: MemoryStore; owner: string; newId: () => string; now: () => string }) {
   if (!deps.owner.trim()) throw new Error('Trusted owner is required');
   const { media, blobs, memories, owner } = deps;
   // Blob keys are content-addressed: one photo (owner and SHA-256) always maps to the same three keys.
-  const keyOf = (sha256: string, variant: MediaVariant) => `${owner}/${sha256}/${variant}`;
-  async function linkable(value: unknown): Promise<string | null> {
-    if (value == null) return null;
-    const memoryId = identifier(value);
+  const keyOf = (sha256: Sha256, variant: MediaVariant) => `${owner}/${sha256}/${variant}`;
+  async function linkable(memoryId: MemoryId | null | undefined): Promise<MemoryId | null> {
+    if (memoryId == null) return null;
     if (!await memories.get(owner, memoryId)) throw new MemoryError('NOT_FOUND', 'Memory not found');
     return memoryId;
   }
   // One re-read and one retry after a lost compare-and-set. A photo that vanished or moved to another memory is left alone.
-  async function unlink(item: Media, memoryId: string): Promise<boolean> {
+  async function unlink(item: Media, memoryId: MemoryId): Promise<boolean> {
     let current: Media | null = item;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (current?.memoryId !== memoryId) return false;
-      if (await media.save(owner, { ...current, memoryId: null, version: current.version + 1 }, current.version)) return true;
+      if (await media.save(owner, { ...current, memoryId: null, version: parse(versionSchema, current.version + 1) }, current.version)) return true;
       current = await media.get(owner, item.id);
     }
     return false;
@@ -76,78 +34,78 @@ export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; 
 
   return {
     async upload(input: MediaUpload): Promise<{ media: Media; duplicate: boolean }> {
-      const contentType = photo(input.original, 25 * MiB, 'Original photo', originalTypes);
-      const sha256 = digest(input.sha256);
-      if (toHex(await crypto.subtle.digest('SHA-256', input.original)) !== sha256) invalid('SHA-256 does not match the photo');
-      const parts: { variant: MediaVariant; body: Uint8Array; contentType: string }[] = [{ variant: 'original', body: input.original, contentType }];
-      if (input.display != null) parts.push({ variant: 'display', body: input.display, contentType: photo(input.display, 5 * MiB, 'Display image', derivedTypes) });
-      if (input.thumb != null) parts.push({ variant: 'thumb', body: input.thumb, contentType: photo(input.thumb, MiB, 'Thumbnail', derivedTypes) });
+      const upload = parse(mediaUpload, input);
+      if (await sha256Hex(upload.original.bytes) !== upload.sha256) invalid('SHA-256 does not match the photo');
+      const parts: { variant: MediaVariant; body: Uint8Array<ArrayBuffer>; contentType: PhotoContentType }[] = [
+        { variant: 'original', body: upload.original.bytes, contentType: upload.original.contentType },
+      ];
+      if (upload.display) parts.push({ variant: 'display', body: upload.display.bytes, contentType: upload.display.contentType });
+      if (upload.thumb) parts.push({ variant: 'thumb', body: upload.thumb.bytes, contentType: upload.thumb.contentType });
       const clean = {
-        memoryId: await linkable(input.memoryId),
-        takenAt: input.takenAt == null ? null : instant(input.takenAt),
-        width: dimension(input.width), height: dimension(input.height), caption: caption(input.caption),
+        memoryId: await linkable(upload.memoryId),
+        takenAt: upload.takenAt ?? null, width: upload.width ?? null, height: upload.height ?? null, caption: upload.caption ?? null,
       };
       // Every attempt writes the provided parts under the photo's own keys. On a duplicate this repairs blobs lost out of
       // band; a failed or lost attempt leaves only these keys, which the next attempt overwrites. Nothing is purged here.
-      for (const part of parts) await blobs.put(keyOf(sha256, part.variant), part.body, part.contentType);
-      const [existing] = await media.list(owner, { sha256, limit: 1 });
+      for (const part of parts) await blobs.put(keyOf(upload.sha256, part.variant), part.body, part.contentType);
+      const [existing] = await media.list(owner, { sha256: upload.sha256, limit: 1 });
       if (existing) return { media: existing, duplicate: true };
-      const id = identifier(deps.newId());
-      const record: Media = { ...clean, id, contentType, bytes: input.original.byteLength, sha256, createdAt: instant(deps.now()), version: 1 };
+      const id = parse(mediaIdSchema, deps.newId());
+      const record: Media = {
+        ...clean, id, contentType: upload.original.contentType, bytes: upload.original.bytes.byteLength, sha256: upload.sha256,
+        createdAt: parse(instantSchema, deps.now()), version: FIRST_VERSION,
+      };
       if (await media.save(owner, record, null)) return { media: record, duplicate: false };
       // Lost the race for this hash, or the ID is taken. The winner's blobs use the same keys, so nothing is deleted.
-      const [winner] = await media.list(owner, { sha256, limit: 1 });
+      const [winner] = await media.list(owner, { sha256: upload.sha256, limit: 1 });
       if (winner) return { media: winner, duplicate: true };
       if (await media.get(owner, id)) throw new MemoryError('CONFLICT', 'Photo ID already exists');
       throw new MemoryError('CONFLICT', 'Photo changed during upload; retry');
     },
-    async get(id: string): Promise<Media | null> { return media.get(owner, identifier(id)); },
-    async list(query: MediaQuery = {}): Promise<Media[]> {
-      const limit = query.limit ?? 50;
-      if (!Number.isInteger(limit) || limit < 1 || limit > 200) invalid('Limit must be 1–200');
-      const clean: MediaQuery = { limit };
-      if (query.memoryId !== undefined) clean.memoryId = query.memoryId === null ? null : identifier(query.memoryId);
-      if (query.sha256 !== undefined) clean.sha256 = digest(query.sha256);
-      if (query.afterId !== undefined) clean.afterId = identifier(query.afterId);
+    async get(id: string): Promise<Media | null> { return media.get(owner, parse(mediaIdSchema, id)); },
+    async list(query: MediaQueryInput = {}): Promise<Media[]> {
+      const clean: MediaQuery = parse(mediaQuery, query);
       return media.list(owner, clean);
     },
     async update(id: string, expectedVersion: number, value: MediaEdit): Promise<Media> {
-      identifier(id); version(expectedVersion);
-      if (expectedVersion === Number.MAX_SAFE_INTEGER) invalid('Photo version limit reached');
-      if (!value || value.memoryId === undefined || value.caption === undefined) invalid('memoryId and caption are both required; send null to clear');
-      const clean = { memoryId: await linkable(value.memoryId), caption: caption(value.caption) };
-      const previous = await media.get(owner, id);
+      const mediaKey = parse(mediaIdSchema, id);
+      const expected = parse(versionSchema, expectedVersion);
+      if (expected === Number.MAX_SAFE_INTEGER) invalid('Photo version limit reached');
+      const edit = parse(mediaEdit, value);
+      const clean = { memoryId: await linkable(edit.memoryId), caption: edit.caption };
+      const previous = await media.get(owner, mediaKey);
       if (!previous) throw new MemoryError('NOT_FOUND', 'Photo not found');
-      const next: Media = { ...previous, ...clean, version: expectedVersion + 1 };
-      if (!await media.save(owner, next, expectedVersion)) throw new MemoryError('CONFLICT', 'Photo has changed; read the latest version');
+      const next: Media = { ...previous, ...clean, version: parse(versionSchema, expected + 1) };
+      if (!await media.save(owner, next, expected)) throw new MemoryError('CONFLICT', 'Photo has changed; read the latest version');
       return next;
     },
     async remove(id: string, expectedVersion: number): Promise<void> {
-      identifier(id); version(expectedVersion);
-      const item = await media.get(owner, id);
+      const mediaKey = parse(mediaIdSchema, id);
+      const expected = parse(versionSchema, expectedVersion);
+      const item = await media.get(owner, mediaKey);
       // Already gone: the state this call asks for already holds, so a repeat succeeds.
       if (!item) return;
-      if (item.version !== expectedVersion) throw new MemoryError('CONFLICT', 'Photo missing or changed');
+      if (item.version !== expected) throw new MemoryError('CONFLICT', 'Photo missing or changed');
       // Blobs go first. A crash here leaves the row, and a retry finishes the job; a reported success never leaves bytes behind.
-      await blobs.delete(variants.map(variant => keyOf(item.sha256, variant)));
-      if (await media.delete(owner, id, expectedVersion)) return;
+      await blobs.delete(MEDIA_VARIANTS.map((variant) => keyOf(item.sha256, variant)));
+      if (await media.delete(owner, mediaKey, expected)) return;
       // The compare-and-set lost: a row still there has changed (conflict); a row that is gone was removed meanwhile (success).
-      if (await media.get(owner, id)) throw new MemoryError('CONFLICT', 'Photo missing or changed');
+      if (await media.get(owner, mediaKey)) throw new MemoryError('CONFLICT', 'Photo missing or changed');
     },
     async read(id: string, variant: MediaVariant): Promise<BlobObject | null> {
-      identifier(id);
-      if (!variants.includes(variant)) invalid('Unknown photo variant');
-      const item = await media.get(owner, id);
-      return item ? blobs.get(keyOf(item.sha256, variant)) : null;
+      const mediaKey = parse(mediaIdSchema, id);
+      const checked = parse(mediaVariantSchema, variant);
+      const item = await media.get(owner, mediaKey);
+      return item ? blobs.get(keyOf(item.sha256, checked)) : null;
     },
     async unlinkMemory(memoryId: string): Promise<number> {
-      identifier(memoryId);
+      const linked = parse(memoryIdSchema, memoryId);
       let unlinked = 0;
-      let afterId: string | undefined;
+      let afterId: MediaId | undefined;
       for (;;) {
-        const page = await media.list(owner, { memoryId, afterId, limit: 200 });
+        const page = await media.list(owner, { memoryId: linked, afterId, limit: MAX_PAGE_LIMIT });
         if (!page.length) return unlinked;
-        for (const item of page) if (await unlink(item, memoryId)) unlinked++;
+        for (const item of page) if (await unlink(item, linked)) unlinked++;
         afterId = page[page.length - 1].id;
       }
     },

@@ -9,6 +9,8 @@ import { createD1Store } from '../src/storage/d1.ts';
 import { schema } from '../src/storage/sql-store.ts';
 import { createMemoryService } from '../src/core/service.ts';
 import type { MemoryStore } from '../src/core/contracts.ts';
+import type { D1Binding } from '../src/storage/d1.ts';
+import { memoryIdOf } from './brands.ts';
 
 // Emulates only the D1 binding boundary. This is not a Cloudflare runtime test.
 function simulatedD1() {
@@ -179,4 +181,22 @@ test('D1 outages reject instead of returning a missing record', async () => {
 test('D1 initial migration matches local SQLite schema', () => {
   const migration = readFileSync(new URL('../migrations/d1/0001_memories.sql', import.meta.url), 'utf8');
   assert.equal(migration.trim(), schema.trim());
+});
+
+test('a corrupt memory payload is refused on read instead of being returned as a memory', async () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(schema);
+  // An unknown kind can only come from damaged storage; the core never writes one.
+  const payload = { kind: 'diary', text: 'x', occurredAt: null, relatedIds: [], id: 'm0001', originalText: 'x', createdAt: '2026-10-09T12:00:00.000Z', updatedAt: '2026-10-09T12:00:00.000Z', version: 1 };
+  db.prepare('INSERT INTO memories (owner, id, payload, search_text, occurred_at, version) VALUES (?, ?, ?, ?, ?, ?)').run('alice', 'm0001', JSON.stringify(payload), 'x', null, 1);
+  const binding: D1Binding = { prepare(sql) { return { bind(...args) { return {
+    async all() { return { success: true, results: db.prepare(sql).all(...args) }; },
+    async run() { return { success: true, meta: { changes: Number(db.prepare(sql).run(...args).changes) } }; },
+  }; } }; } };
+  try {
+    const store = createD1Store(binding);
+    const corrupt = (error: unknown) => error instanceof Error && error.constructor === Error && /Corrupt memory payload in storage/.test(error.message);
+    await assert.rejects(store.get('alice', memoryIdOf('m0001')), corrupt);
+    await assert.rejects(store.list('alice', { limit: 10 }), corrupt);
+  } finally { db.close(); }
 });

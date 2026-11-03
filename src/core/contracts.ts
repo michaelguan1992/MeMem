@@ -1,31 +1,29 @@
-/** No provider SDK, HTTP, SQL, environment variables, or AI model types here. */
-export type MemoryKind = 'event' | 'person' | 'place' | 'fact';
-export interface MemoryInput {
+/** No provider SDK, HTTP, SQL, environment variables, or AI model types here. Only type imports from the schema. */
+import type { Instant, MediaId, MemoryId, MemoryKind, PhotoContentType, Sha256, Version } from './schema.ts';
+
+export interface Memory {
+  id: MemoryId;
   kind: MemoryKind;
   text: string;
-  /** Actual event time, supplied explicitly; null means unknown. */
-  occurredAt?: string | null;
-  /** Related record IDs, not inferred names or assumed relationships. */
-  relatedIds?: string[];
-}
-export interface Memory extends MemoryInput {
-  id: string;
+  /** The first text this record was saved with; kept as history and never returned to clients. */
   originalText: string;
-  occurredAt: string | null;
-  relatedIds: string[];
-  createdAt: string;
-  updatedAt: string;
-  version: number;
+  /** Actual event time, supplied explicitly; null means unknown. */
+  occurredAt: Instant | null;
+  /** Related record IDs, not inferred names or assumed relationships. */
+  relatedIds: MemoryId[];
+  createdAt: Instant;
+  updatedAt: Instant;
+  version: Version;
 }
 export interface MemoryQuery {
   /** Literal case-insensitive substring, NOT semantic search. */
   text?: string;
-  relatedTo?: string;
+  relatedTo?: MemoryId;
   /** Inclusive start / exclusive end against occurredAt; unknown times excluded. */
-  from?: string;
-  before?: string;
+  from?: Instant;
+  before?: Instant;
   /** Keyset pagination in ascending record ID order, NOT chronological order. */
-  afterId?: string;
+  afterId?: MemoryId;
   limit?: number;
 }
 /** Adapter contract. All operations MUST enforce the trusted owner scope.
@@ -34,30 +32,30 @@ export interface MemoryQuery {
  * Provider failures reject. Results must be detached values, not mutable store references.
  */
 export interface MemoryStore {
-  get(owner: string, id: string): Promise<Memory | null>;
+  get(owner: string, id: MemoryId): Promise<Memory | null>;
   list(owner: string, query: MemoryQuery): Promise<Memory[]>;
-  save(owner: string, memory: Memory, expectedVersion: number | null): Promise<boolean>;
-  delete(owner: string, id: string, expectedVersion: number): Promise<boolean>;
+  save(owner: string, memory: Memory, expectedVersion: Version | null): Promise<boolean>;
+  delete(owner: string, id: MemoryId, expectedVersion: Version): Promise<boolean>;
 }
 
 /** Platform-neutral metadata for one privately stored photo. */
 export interface Media {
-  id: string;
-  memoryId: string | null;
-  contentType: 'image/jpeg' | 'image/heic' | 'image/png' | 'image/webp';
+  id: MediaId;
+  memoryId: MemoryId | null;
+  contentType: PhotoContentType;
   bytes: number;
-  sha256: string;
-  takenAt: string | null;
+  sha256: Sha256;
+  takenAt: Instant | null;
   width: number | null;
   height: number | null;
   caption: string | null;
-  createdAt: string;
-  version: number;
+  createdAt: Instant;
+  version: Version;
 }
 export interface MediaQuery {
-  memoryId?: string | null;
-  sha256?: string;
-  afterId?: string;
+  memoryId?: MemoryId | null;
+  sha256?: Sha256;
+  afterId?: MediaId;
   limit?: number;
 }
 /**
@@ -66,10 +64,10 @@ export interface MediaQuery {
  * metadata must be detached values, never mutable adapter references.
  */
 export interface MediaStore {
-  get(owner: string, id: string): Promise<Media | null>;
+  get(owner: string, id: MediaId): Promise<Media | null>;
   list(owner: string, query?: MediaQuery): Promise<Media[]>;
-  save(owner: string, media: Media, expectedVersion: number | null): Promise<boolean>;
-  delete(owner: string, id: string, expectedVersion: number): Promise<boolean>;
+  save(owner: string, media: Media, expectedVersion: Version | null): Promise<boolean>;
+  delete(owner: string, id: MediaId, expectedVersion: Version): Promise<boolean>;
 }
 export interface BlobObject {
   body: ReadableStream<Uint8Array> | Uint8Array;

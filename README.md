@@ -6,7 +6,7 @@ The Worker and full OAuth/MCP flow are covered by local Miniflare integration te
 
 ## Components
 
-- `src/core/` contains the platform-independent memory rules and `MemoryStore` interface, plus the photo rules in `media.ts` behind separate `MediaStore` and `BlobStore` interfaces.
+- `src/core/` contains the platform-independent memory rules and `MemoryStore` interface. `schema.ts` is the one place those rules and their messages are written (zod schemas that produce the branded IDs, digests, timestamps, and versions); `service.ts` and `media.ts` apply them, with the photo service behind separate `MediaStore` and `BlobStore` interfaces.
 - `src/storage/` contains local SQLite and D1 adapters for memories and photo metadata.
 - `src/platform/` composes the core for Cloudflare: the R2 photo store, the `/capture` web page and its owner-passphrase session, and the session-protected `/api/*` JSON and upload endpoints.
 - `src/client/` holds the `/capture` browser script and the JPEG EXIF reader, both in TypeScript. `npm run build:client` (esbuild) bundles them into the gitignored `src/generated/`, and `check`, `test`, `coverage`, `dev`, and `deploy` run it automatically.

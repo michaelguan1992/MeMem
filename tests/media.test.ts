@@ -10,7 +10,8 @@ import { createD1MediaStore } from '../src/storage/media-d1.ts';
 import { createD1Store } from '../src/storage/d1.ts';
 import type { D1Binding } from '../src/storage/d1.ts';
 import { createMediaService } from '../src/core/media.ts';
-import type { MediaUpload, MediaVariant } from '../src/core/media.ts';
+import type { MediaUpload, MediaVariant } from '../src/core/schema.ts';
+import { instantOf, mediaIdOf, memoryIdOf, sha256Of, versionOf } from './brands.ts';
 import { createMemoryService } from '../src/core/service.ts';
 import type { Media, MediaQuery, MediaStore } from '../src/core/contracts.ts';
 
@@ -75,7 +76,7 @@ function racingStore(t: Setup, edit: Partial<Media>): MediaStore {
       if (!raced && expectedVersion !== null) {
         raced = true;
         const current = await t.media.get(owner, record.id) as Media;
-        await t.media.save(owner, { ...current, ...edit, version: current.version + 1 }, current.version);
+        await t.media.save(owner, { ...current, ...edit, version: versionOf(current.version + 1) }, current.version);
       }
       return t.media.save(owner, record, expectedVersion);
     },
@@ -107,7 +108,7 @@ test('JPEG upload stores normalized metadata and original, display, and thumbnai
       takenAt: '2026-04-02T01:00:00.000Z', width: 4032, height: 3024, caption: 'Kyoto',
       createdAt: '2026-10-09T12:00:00.000Z', version: 1,
     });
-    assert.deepEqual(await t.media.get('alice', 'p0001'), result.media);
+    assert.deepEqual(await t.media.get('alice', mediaIdOf('p0001')), result.media);
     assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`, `alice/${sha(jpeg)}/thumb`]);
     assert.equal(t.blobs.objects.get(`alice/${sha(jpeg)}/thumb`)?.contentType, 'image/webp');
   } finally { t.close(); }
@@ -199,7 +200,7 @@ test('a failed blob write leaves only content-keyed blobs, and the next upload o
   const t = setup((key) => failing && key.endsWith('/thumb'));
   try {
     await assert.rejects(service(t).upload(input(jpeg, { display: jpeg, thumb: webp })), /R2 put failed/);
-    assert.equal(await t.media.get('alice', 'p0001'), null);
+    assert.equal(await t.media.get('alice', mediaIdOf('p0001')), null);
     // Nothing purges after a failed upload; the blobs it left are the photo's own keys, which the next upload overwrites.
     assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`]);
     failing = false;
@@ -226,8 +227,8 @@ test('a duplicate upload rewrites a blob that is missing from storage', async ()
 test('a lost race reports the winner and deletes nothing', async () => {
   const t = setup();
   try {
-    const winner: Media = { id: 'winner', memoryId: null, contentType: 'image/jpeg', bytes: jpeg.byteLength, sha256: sha(jpeg),
-      takenAt: null, width: null, height: null, caption: null, createdAt: '2026-10-09T12:00:00.000Z', version: 1 };
+    const winner: Media = { id: mediaIdOf('winner'), memoryId: null, contentType: 'image/jpeg', bytes: jpeg.byteLength, sha256: sha256Of(sha(jpeg)),
+      takenAt: null, width: null, height: null, caption: null, createdAt: instantOf('2026-10-09T12:00:00.000Z'), version: versionOf(1) };
     // The winning upload saves its row after this upload has written its blobs.
     const result = await service(t, 'alice', racingInsert(t, winner)).upload(input(jpeg, { display: jpeg }));
     assert.deepEqual(result, { media: winner, duplicate: true });
@@ -393,7 +394,7 @@ test('unlinkMemory leaves a photo alone when it moved to another memory mid-run'
     await memory(t);
     await memory(t, 'alice', 'other');
     const { media: photo } = await service(t).upload(input(jpeg, { memoryId: 'trip' }));
-    const unlinked = await service(t, 'alice', racingStore(t, { memoryId: 'other' })).unlinkMemory('trip');
+    const unlinked = await service(t, 'alice', racingStore(t, { memoryId: memoryIdOf('other') })).unlinkMemory('trip');
     assert.equal(unlinked, 0);
     assert.equal((await t.media.get('alice', photo.id))?.memoryId, 'other');
   } finally { t.close(); }
@@ -402,22 +403,22 @@ test('unlinkMemory leaves a photo alone when it moved to another memory mid-run'
 test('media store filters, pages, compares versions and enforces unique hashes per owner', async () => {
   const t = setup();
   try {
-    const row = (id: string, memoryId: string | null, hash: string): Media => ({ id, memoryId, contentType: 'image/jpeg', bytes: 1, sha256: hash,
-      takenAt: null, width: null, height: null, caption: null, createdAt: '2026-10-09T12:00:00.000Z', version: 1 });
+    const row = (id: string, memoryId: string | null, hash: string): Media => ({ id: mediaIdOf(id), memoryId: memoryId === null ? null : memoryIdOf(memoryId), contentType: 'image/jpeg', bytes: 1, sha256: sha256Of(hash),
+      takenAt: null, width: null, height: null, caption: null, createdAt: instantOf('2026-10-09T12:00:00.000Z'), version: versionOf(1) });
     const a = row('a', 'trip', 'a'.repeat(64)), b = row('b', null, 'b'.repeat(64)), c = row('c', 'trip', 'c'.repeat(64));
     for (const item of [a, b, c]) assert.equal(await t.media.save('alice', item, null), true);
     assert.equal(await t.media.save('alice', row('d', null, 'b'.repeat(64)), null), false); // same hash
     assert.equal(await t.media.save('alice', row('a', null, 'e'.repeat(64)), null), false); // same ID
     const ids = async (query?: MediaQuery) => (await t.media.list('alice', query)).map(item => item.id);
     assert.deepEqual(await ids(), ['a', 'b', 'c']);
-    assert.deepEqual(await ids({ memoryId: 'trip' }), ['a', 'c']);
+    assert.deepEqual(await ids({ memoryId: memoryIdOf('trip') }), ['a', 'c']);
     assert.deepEqual(await ids({ memoryId: null }), ['b']);
-    assert.deepEqual(await ids({ sha256: 'c'.repeat(64) }), ['c']);
-    assert.deepEqual(await ids({ afterId: 'a', limit: 1 }), ['b']);
-    assert.equal(await t.media.save('alice', { ...a, caption: 'edited', version: 2 }, 1), true);
-    assert.equal(await t.media.save('alice', { ...a, caption: 'stale', version: 2 }, 1), false);
-    assert.equal(await t.media.delete('alice', 'a', 1), false);
-    assert.equal(await t.media.delete('alice', 'a', 2), true);
+    assert.deepEqual(await ids({ sha256: sha256Of('c'.repeat(64)) }), ['c']);
+    assert.deepEqual(await ids({ afterId: mediaIdOf('a'), limit: 1 }), ['b']);
+    assert.equal(await t.media.save('alice', { ...a, caption: 'edited', version: versionOf(2) }, versionOf(1)), true);
+    assert.equal(await t.media.save('alice', { ...a, caption: 'stale', version: versionOf(2) }, versionOf(1)), false);
+    assert.equal(await t.media.delete('alice', mediaIdOf('a'), versionOf(1)), false);
+    assert.equal(await t.media.delete('alice', mediaIdOf('a'), versionOf(2)), true);
     assert.equal(await t.media.save('bob', b, null), true); // uniqueness is per owner
     assert.deepEqual(await ids(), ['b', 'c']);
   } finally { t.close(); }
@@ -441,7 +442,7 @@ test('D1 media store works through a simulated binding and rejects provider fail
     const { media: photo } = await api.upload(input(jpeg, { memoryId: 'trip' }));
     assert.deepEqual(await api.get(photo.id), photo);
     assert.equal((await api.upload(input(jpeg))).duplicate, true);
-    assert.equal(await media.delete('alice', photo.id, 2), false);
+    assert.equal(await media.delete('alice', photo.id, versionOf(2)), false);
     await api.remove(photo.id, 1);
     assert.equal(await media.get('alice', photo.id), null);
   } finally { db.close(); }
@@ -449,11 +450,29 @@ test('D1 media store works through a simulated binding and rejects provider fail
     async all() { return { success: false, results: [] }; },
     async run() { return { success: false, meta: { changes: 0 } }; },
   }; } }; } };
-  await assert.rejects(createD1MediaStore(failing).get('alice', 'p0001'), /D1 read failed/);
-  await assert.rejects(createD1MediaStore(failing).delete('alice', 'p0001', 1), /D1 write failed/);
+  await assert.rejects(createD1MediaStore(failing).get('alice', mediaIdOf('p0001')), /D1 read failed/);
+  await assert.rejects(createD1MediaStore(failing).delete('alice', mediaIdOf('p0001'), versionOf(1)), /D1 write failed/);
 });
 
 test('media schema matches the D1 migration', () => {
   const migration = readFileSync(new URL('../migrations/d1/0002_media.sql', import.meta.url), 'utf8');
   assert.ok(migration.includes(mediaSchema.trim()));
+});
+
+test('a corrupt media row is refused on read instead of being returned as a photo', async () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(schema);
+  db.exec(mediaSchema);
+  // A digest that is not 64 lowercase hex characters can only come from damaged storage; the core never writes one.
+  db.prepare("INSERT INTO media (owner, id, memory_id, content_type, bytes, sha256, taken_at, width, height, caption, created_at, version) VALUES ('alice', 'p0001', NULL, 'image/jpeg', 3, 'NOT-A-DIGEST', NULL, NULL, NULL, NULL, '2026-10-09T12:00:00.000Z', 1)").run();
+  const binding: D1Binding = { prepare(sql) { return { bind(...args) { return {
+    async all() { return { success: true, results: db.prepare(sql).all(...args) }; },
+    async run() { return { success: true, meta: { changes: Number(db.prepare(sql).run(...args).changes) } }; },
+  }; } }; } };
+  try {
+    const media = createD1MediaStore(binding);
+    const corrupt = (error: unknown) => error instanceof Error && error.constructor === Error && /Corrupt media row in storage/.test(error.message);
+    await assert.rejects(media.get('alice', mediaIdOf('p0001')), corrupt);
+    await assert.rejects(media.list('alice'), corrupt);
+  } finally { db.close(); }
 });

@@ -1,5 +1,7 @@
 'use strict';
 
+// Type-only: erased from the bundle, so the browser script never includes the schema module (and zod) at runtime.
+import type { MediaVariant } from '../core/schema.ts';
 import { readJpegTakenAt } from './exif.ts';
 
 /**
@@ -16,6 +18,8 @@ const MAX_ORIGINAL_BYTES = 25 * 1024 * 1024;
 const MAX_DISPLAY_BYTES = 5 * 1024 * 1024;
 const MAX_THUMB_BYTES = 1024 * 1024;
 const WALL_TIME = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?$/;
+// Checked against the server's variant list by the type checker, so a renamed variant fails the build.
+const THUMB_VARIANT: MediaVariant = 'thumb';
 
 type Phase = 'waiting' | 'working' | 'saved' | 'failed';
 
@@ -434,7 +438,7 @@ function startCapturePage(): void {
       thumb.width = 96;
       thumb.height = 96;
       thumb.alt = 'Saved photo';
-      thumb.src = '/api/media/' + encodeURIComponent(String(item.mediaId)) + '/thumb';
+      thumb.src = '/api/media/' + encodeURIComponent(String(item.mediaId)) + '/' + THUMB_VARIANT;
       thumb.addEventListener('error', () => { thumb.alt = 'Saved; no preview'; });
       const caption = document.createElement('figcaption');
       caption.textContent = item.message;

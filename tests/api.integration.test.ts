@@ -436,3 +436,28 @@ test('unknown routes and wrong methods get JSON errors, with Allow where it appl
   }
   expect((await SELF.fetch(request('GET', '/api/nope', null))).status).toBe(401);
 });
+
+test('request errors keep their messages for unknown fields, wrong values and form fields', async () => {
+  await reset();
+  const auth = await signIn();
+  const memoryId = await createEntry(auth, 'Kyoto');
+  const photoId = (await uploadPhoto(auth, { original: file(jpeg('messages')), memoryId })).id;
+  const path = `/api/media/${photoId}`;
+  const rejected: [Promise<Response>, string][] = [
+    [SELF.fetch(jsonRequest('POST', '/api/entries', auth, { text: 'x', kind: 'fact' })), 'Request body has an unknown field'],
+    [SELF.fetch(jsonRequest('POST', '/api/entries', auth, ['not', 'an', 'object'])), 'Request body must be a JSON object'],
+    [SELF.fetch(jsonRequest('POST', '/api/entries', auth, { text: '   ' })), 'Text must contain 1–20000 characters'],
+    [SELF.fetch(jsonRequest('POST', '/api/entries', auth, { text: 'x', relatedIds: 'nope' })), 'At most 100 related IDs are allowed'],
+    [SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 1, memoryId: null })), 'memoryId and caption are both required; send null to clear'],
+    [SELF.fetch(jsonRequest('DELETE', path, auth, { expectedVersion: 'one' })), 'Expected a positive record version'],
+    [SELF.fetch(request('GET', '/api/media/bad%20id/original', auth)), 'Invalid record identifier'],
+    [upload(auth, { original: 'not a file' }), 'original must be an uploaded photo'],
+    [upload(auth, { original: file(jpeg('width')), width: '12.5' }), 'width must be a decimal integer'],
+    [upload(auth, { original: file(jpeg('caption')), caption: 'c'.repeat(2001) }), 'Caption must be at most 2000 characters'],
+  ];
+  for (const [pending, message] of rejected) {
+    const response = await pending;
+    expect({ message, status: response.status, body: await json(response) })
+      .toEqual({ message, status: 400, body: { error: 'INVALID_INPUT', message } });
+  }
+});

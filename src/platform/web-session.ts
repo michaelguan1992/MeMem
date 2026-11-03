@@ -1,5 +1,9 @@
+import { z } from 'zod';
+import { parseStored } from '../core/schema.ts';
 import type { D1Binding } from '../storage/d1.ts';
 import { constantTimeEqual } from './owner-password.ts';
+
+const sessionRow = z.object({ owner: z.string(), csrf_token_hash: z.string() });
 
 export const SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
 const COOKIE_NAME = '__Host-memem_session';
@@ -51,8 +55,9 @@ export async function readSession(db: D1Binding, request: Request, now: Date): P
     .bind(tokenHash, now.toISOString()).all();
   if (!result.success) throw new Error('D1 read failed');
   const row = result.results[0];
-  if (!row || typeof row.owner !== 'string' || typeof row.csrf_token_hash !== 'string') return null;
-  return { owner: row.owner, csrf: await csrfFor(token), tokenHash, csrfTokenHash: row.csrf_token_hash };
+  if (!row) return null;
+  const { owner, csrf_token_hash: csrfTokenHash } = parseStored(sessionRow, row, 'web session row');
+  return { owner, csrf: await csrfFor(token), tokenHash, csrfTokenHash };
 }
 
 export async function checkCsrf(session: WebSession, submitted: string | null): Promise<boolean> {
