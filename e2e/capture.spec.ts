@@ -1,40 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
-import { query, seedPersonRow, sqlString } from './support/d1.ts';
+import { seedPersonRow } from './support/d1.ts';
 import { expect, test } from './support/fixtures.ts';
 import { jpegSize } from './support/jpeg.ts';
 import { EXIF_PHOTO } from './support/paths.ts';
+import { OWNER_PASSPHRASE, SAVE_BUTTON, expectStatus, rowsWithText, signIn, uniqueText } from './support/owner.ts';
 
-// TEST ONLY. This passphrase is public. Its verifier is in e2e/e2e.env, and the owner's real passphrase and verifier
-// are never read or used by these tests.
-const OWNER_PASSPHRASE = 'memem-e2e-TEST-ONLY-passphrase-not-a-secret';
-const SAVE_BUTTON = 'Save entry';
 const UNREACHABLE = 'Could not reach MeMem. Check the connection; what you typed is still here.';
-
-/** A note text that no other test or run uses, so its rows can be counted exactly. */
-function uniqueText(label: string): string {
-  return `${label} ${randomUUID()}`;
-}
-
-async function signIn(page: Page): Promise<void> {
-  await page.goto('/capture');
-  await page.getByLabel('Owner passphrase').fill(OWNER_PASSPHRASE);
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByLabel('What happened?', { exact: true })).toBeVisible();
-}
-
-function rowsWithText(text: string) {
-  return query<{ id: string; occurred_at: string | null }>(`SELECT id, occurred_at FROM memories WHERE owner = 'owner' AND search_text = ${sqlString(text.toLowerCase())}`);
-}
-
-/** The status line shows this text, and it is styled as an error only when `error` is set. */
-async function expectStatus(page: Page, text: string, error: boolean): Promise<void> {
-  const status = page.getByRole('status');
-  await expect(status).toHaveText(text);
-  if (error) await expect(status).toHaveClass('error');
-  else await expect(status).not.toHaveClass(/error/);
-}
 
 /**
  * Replaces the browser's speech recognition with a fake before the page's scripts run, and removes the WebKit one. Each

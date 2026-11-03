@@ -1,5 +1,6 @@
 import type { D1Binding } from '../storage/d1.ts';
 import { captureScript } from '../generated/capture-script.ts';
+import { historyScript } from '../generated/history-script.ts';
 import { htmlEscape, readFormOrRefusal, sameOriginPost } from './http.ts';
 import { verifyOwnerPassword } from './owner-password.ts';
 import { checkCsrf, clearSessionCookie, createSession, destroySession, readSession, SESSION_MAX_AGE_SECONDS, sessionCookie, type WebSession } from './web-session.ts';
@@ -19,6 +20,7 @@ function htmlHeaders(contentSecurityPolicy: string): Record<string, string> {
   };
 }
 const loginHeaders = htmlHeaders(loginCsp);
+// The capture and history pages share this policy.
 const captureHeaders = htmlHeaders(captureCsp);
 const staticHeaders = { 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' };
 
@@ -34,7 +36,8 @@ const manifest = JSON.stringify({
 });
 const iconSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#2d6a5a"/><path d="M120 392V120h80l56 110 56-110h80v272h-64V232l-72 118-72-118v160z" fill="#ffffff"/></svg>';
 
-const captureStyles = `
+// The styles both signed-in pages share: colour tokens, base layout, and the controls they have in common.
+const sharedStyles = `
 :root { color-scheme: light dark; --bg: #f5f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #62625b; --line: #cfcfc5; --accent: #2d6a5a; --accent-ink: #ffffff; --danger: #a33a2b; --focus: #1f5fbf; }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #161615; --panel: #232320; --ink: #f1f1ec; --muted: #a9a99f; --line: #3d3d37; --accent: #62b59f; --accent-ink: #0e1f19; --danger: #ff9584; --focus: #8ab4ff; }
@@ -43,19 +46,33 @@ const captureStyles = `
 body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
 main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
 h1 { margin: 0 0 20px; font-size: 1.5rem; }
+a { color: var(--accent); }
+.nav { margin: -8px 0 20px; }
 form { margin: 0; }
-#capture-form { display: grid; gap: 20px; }
 .field { display: grid; gap: 8px; min-width: 0; }
 .field > label { font-weight: 600; }
 textarea, input[type="datetime-local"] { width: 100%; min-height: 48px; padding: 10px 12px; font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
 textarea { min-height: 9em; resize: vertical; }
-input[type="file"] { width: 100%; min-height: 48px; font: inherit; color: var(--ink); }
-#related { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+#related, .related { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+fieldset { min-width: 0; }
 legend { padding: 0 4px; font-weight: 600; }
 .choices { display: grid; gap: 2px; }
 .group-title { margin: 10px 0 2px; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
 .choice { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 6px 4px; }
 .choice input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
+.hint { margin: 0; font-size: 0.85rem; color: var(--muted); }
+button { min-height: 48px; padding: 0 18px; font: inherit; font-weight: 600; border: 0; border-radius: 12px; cursor: pointer; }
+button:disabled, textarea:disabled, input:disabled, select:disabled { opacity: 0.55; cursor: default; }
+#status { min-height: 1.5em; margin: 16px 0 0; }
+#status.error { color: var(--danger); }
+.logout { margin-top: 36px; }
+.logout button { color: var(--muted); background: transparent; border: 1px solid var(--line); }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+`;
+
+const captureStyles = `${sharedStyles}
+#capture-form { display: grid; gap: 20px; }
+input[type="file"] { width: 100%; min-height: 48px; font: inherit; color: var(--ink); }
 .photos { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .photo { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 12px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .photo img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; background: var(--line); }
@@ -64,11 +81,8 @@ legend { padding: 0 4px; font-weight: 600; }
 .photo .status { display: block; font-size: 0.9rem; color: var(--muted); }
 .photo[data-state="saved"] .status { color: var(--accent); }
 .photo[data-state="failed"] .status { color: var(--danger); }
-button { min-height: 48px; padding: 0 18px; font: inherit; font-weight: 600; border: 0; border-radius: 12px; cursor: pointer; }
 #save-button { width: 100%; background: var(--accent); color: var(--accent-ink); }
-button:disabled, textarea:disabled, input:disabled, select:disabled { opacity: 0.55; cursor: default; }
-#status { min-height: 1.5em; margin: 16px 0 0; }
-#status.error, #dictate-status.error { color: var(--danger); }
+#dictate-status.error { color: var(--danger); }
 .dictate { display: grid; gap: 8px; }
 .dictate[hidden] { display: none; }
 .dictate-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
@@ -76,14 +90,51 @@ button:disabled, textarea:disabled, input:disabled, select:disabled { opacity: 0
 #dictate-button[aria-pressed="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
 #dictate-lang { min-height: 48px; padding: 0 12px; font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
 #dictate-status { min-height: 1.5em; margin: 0; font-size: 0.9rem; color: var(--muted); overflow-wrap: anywhere; }
-.hint { margin: 0; font-size: 0.85rem; color: var(--muted); }
 .saved { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 0; }
 .saved figure { width: 96px; margin: 0; }
 .saved img { display: block; width: 96px; height: 96px; object-fit: cover; border-radius: 12px; background: var(--line); }
 .saved figcaption { margin-top: 4px; font-size: 0.8rem; color: var(--muted); }
-.logout { margin-top: 36px; }
-.logout button { color: var(--muted); background: transparent; border: 1px solid var(--line); }
-:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+`;
+
+const historyStyles = `${sharedStyles}
+.entries { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+.entry { display: grid; gap: 10px; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.entry.editing { border-color: var(--accent); }
+.entry .when { margin: 0; font-weight: 600; }
+.entry .body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.entry .linked { margin: 0; font-size: 0.9rem; color: var(--muted); overflow-wrap: anywhere; }
+.entry > .edit { justify-self: start; color: var(--ink); background: transparent; border: 1px solid var(--line); }
+.thumbs { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.thumbs:empty { display: none; }
+.thumbs img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; background: var(--line); }
+.editor { display: grid; gap: 16px; min-width: 0; }
+.editor-fields { display: grid; gap: 16px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.editor-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.editor-actions button { flex: 1 1 140px; }
+.primary { color: var(--accent-ink); background: var(--accent); }
+.secondary { color: var(--ink); background: var(--panel); border: 1px solid var(--line); }
+.danger { color: var(--danger); background: var(--panel); border: 1px solid var(--danger); }
+[hidden] { display: none !important; }
+.photos-area { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.photos-area input[type="file"] { width: 100%; min-height: 48px; font: inherit; color: var(--ink); }
+.uploads { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.upload { display: grid; gap: 2px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; }
+.upload .name { overflow-wrap: anywhere; }
+.upload .status { font-size: 0.9rem; color: var(--muted); }
+.upload[data-state="saved"] .status { color: var(--accent); }
+.upload[data-state="failed"] .status { color: var(--danger); }
+.status-line { min-height: 1.5em; margin: 0; overflow-wrap: anywhere; }
+.status-line.error { color: var(--danger); }
+.linked-photos, .pick { min-width: 0; }
+.photo-grid { display: flex; flex-wrap: wrap; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.photo-card { display: grid; gap: 8px; width: 150px; max-width: 100%; min-width: 0; margin: 0; }
+.photo-card a { display: block; }
+.photo-card img { display: block; width: 100%; height: auto; aspect-ratio: 1; object-fit: cover; border-radius: 8px; background: var(--line); }
+.photo-card .taken { margin: 0; font-size: 0.85rem; color: var(--muted); }
+.photo-card button { min-height: 44px; padding: 0 10px; font-size: 0.9rem; }
+.unlinked { min-width: 0; margin-top: 32px; }
+.unlinked h2 { margin: 0 0 6px; font-size: 1.2rem; }
+.unlinked > .hint { margin-bottom: 12px; }
 `;
 
 function capturePage(csrf: string): string {
@@ -105,6 +156,7 @@ function capturePage(csrf: string): string {
 <body>
 <main>
 <h1>MeMem capture</h1>
+<p class="nav"><a href="/capture/history">Past entries</a></p>
 <noscript><p>MeMem capture needs JavaScript to prepare photos before upload.</p></noscript>
 <form id="capture-form" method="post" action="/capture" novalidate>
 <div class="field">
@@ -148,6 +200,42 @@ function capturePage(csrf: string): string {
 </body>
 </html>`;
 }
+
+function historyPage(csrf: string): string {
+  const token = htmlEscape(csrf);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="${token}">
+<meta name="color-scheme" content="light dark">
+<title>MeMem past entries</title>
+<style>${historyStyles}</style>
+<script src="/capture-history.js" defer></script>
+</head>
+<body>
+<main>
+<h1>Past entries</h1>
+<p class="nav"><a href="/capture">New entry</a></p>
+<noscript><p>Past entries needs JavaScript to load and edit entries.</p></noscript>
+<p id="status" role="status" aria-live="polite"></p>
+<ol id="entry-list" class="entries"></ol>
+<section id="unlinked" class="unlinked" aria-labelledby="unlinked-heading">
+<h2 id="unlinked-heading">Unlinked photos</h2>
+<p class="hint">These photos are on no entry. To attach one, open an entry with Edit and choose Add from unlinked photos.</p>
+<p id="unlinked-status" class="status-line" role="status" aria-live="polite"></p>
+<div id="unlinked-list" class="unlinked-list"></div>
+</section>
+<form method="post" action="/capture/logout" class="logout">
+<input type="hidden" name="csrf" value="${token}">
+<button type="submit">Log out</button>
+</form>
+</main>
+</body>
+</html>`;
+}
+
 function htmlResponse(body: string, status = 200, headers: Record<string, string> = loginHeaders): Response {
   return new Response(body, { status, headers });
 }
@@ -177,9 +265,10 @@ interface CaptureCall { request: Request; env: CaptureEnv; owner: string; now: D
 /** A route names the one method it serves. Any other method gets 405 with that method as its Allow value. */
 interface CaptureRoute { method: 'GET' | 'POST'; handle: (call: CaptureCall) => Promise<Response> | Response }
 
-async function showCapture({ request, env, owner, now }: CaptureCall): Promise<Response> {
+/** A signed-in page with its CSRF token, or the sign-in page when the request has no session for this owner. */
+async function signedIn({ request, env, owner, now }: CaptureCall, render: (csrf: string) => string): Promise<Response> {
   const session = await currentSession(env.DB, request, owner, now);
-  return session ? htmlResponse(capturePage(session.csrf), 200, captureHeaders) : htmlResponse(loginPage());
+  return session ? htmlResponse(render(session.csrf), 200, captureHeaders) : htmlResponse(loginPage());
 }
 
 async function postLogin({ request, env, owner, now }: CaptureCall): Promise<Response> {
@@ -207,10 +296,12 @@ async function postLogout({ request, env, owner, now }: CaptureCall): Promise<Re
 
 // Exact paths. A matched path checks its method first (405), then the handler runs its own origin, session and CSRF checks.
 const captureRoutes = new Map<string, CaptureRoute>([
-  ['/capture', { method: 'GET', handle: showCapture }],
+  ['/capture', { method: 'GET', handle: (call) => signedIn(call, capturePage) }],
+  ['/capture/history', { method: 'GET', handle: (call) => signedIn(call, historyPage) }],
   ['/capture/login', { method: 'POST', handle: postLogin }],
   ['/capture/logout', { method: 'POST', handle: postLogout }],
   ['/capture.js', { method: 'GET', handle: () => staticResponse(captureScript, 'text/javascript; charset=utf-8') }],
+  ['/capture-history.js', { method: 'GET', handle: () => staticResponse(historyScript, 'text/javascript; charset=utf-8') }],
   ['/capture.webmanifest', { method: 'GET', handle: () => staticResponse(manifest, 'application/manifest+json') }],
   ['/capture-icon.svg', { method: 'GET', handle: () => staticResponse(iconSvg, 'image/svg+xml', { 'Content-Security-Policy': "default-src 'none'" }) }],
 ]);

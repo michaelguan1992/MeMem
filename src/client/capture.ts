@@ -1,13 +1,10 @@
 'use strict';
 
 import {
-  DISPLAY_EDGE,
   TEXT,
-  THUMB_EDGE,
-  checkOriginalSize,
+  browserClock,
   controlsFor,
   currentWall,
-  derivativesOf,
   dictationErrorMessage,
   dictationLanguageFor,
   displayNameOf,
@@ -16,56 +13,44 @@ import {
   entryBody,
   entryContent,
   failureMessage,
-  fitEdges,
   groupRelated,
-  hexOf,
   insertTranscript,
   isMissingWords,
   joinTranscripts,
-  linkBody,
   loadAllRelated,
-  mediaPath,
   messageOf,
-  needsLink,
   occurredAtOf,
   pendingNotice,
   pendingOf,
-  photoForm,
-  photoOutcome,
   prefillFrom,
   requestPlan,
   splitResults,
   statusClassOf,
-  takenAtOf,
   thumbPath,
 } from './capture-logic.ts';
 import type {
-  Clock,
   CreatedEntry,
-  Derivatives,
   DictationLanguage,
   Draft,
   EntryBody,
-  MediaEnvelope,
   Phase,
   Prefill,
   RelatedGroup,
   RelatedItem,
   RelatedPage,
   RequestPlan,
-  Size,
   SpeechResultLike,
-  UploadResult,
 } from './capture-logic.ts';
+import { uploadPhotoFile } from './photo-upload.ts';
 
 /**
  * Browser script for the /capture page, served as /capture.js (no inline script is allowed by the page policy).
- * scripts/build-client.mjs bundles this file with ./capture-logic.ts and ./exif.ts into src/generated/capture-script.ts.
- * Every value from the server or from a photo is written with textContent. The script never uses innerHTML,
- * insertAdjacentHTML, document.write or eval. This file holds the DOM work; the logic it calls is in capture-logic.ts.
+ * scripts/build-client.mjs bundles this file with ./capture-logic.ts, ./exif.ts and ./photo-upload.ts into
+ * src/generated/capture-script.ts. Every value from the server or from a photo is written with textContent. The script
+ * never uses innerHTML, insertAdjacentHTML, document.write or eval. This file holds the page's DOM work; the photo
+ * pipeline is in photo-upload.ts, and the logic both call is in capture-logic.ts.
  */
 
-const JPEG_QUALITY = 0.85;
 // The dictation language's localStorage key. Storage can be blocked, so every access to it is guarded.
 const DICTATE_LANGUAGE_KEY = 'memem-dictate-lang';
 
@@ -136,12 +121,6 @@ interface CapturePage {
   csrf: string;
   state: CaptureState;
 }
-
-const browserClock: Clock = {
-  now: () => new Date(),
-  offsetAt: (instant) => -instant.getTimezoneOffset(),
-  localInstant: (year, monthIndex, day, hour, minute) => new Date(year, monthIndex, day, hour, minute),
-};
 
 const newId = (): string => crypto.randomUUID();
 
@@ -340,59 +319,15 @@ function checkedIds(page: CapturePage): string[] {
   return Array.from(page.els.relatedList.querySelectorAll<HTMLInputElement>('input[type=checkbox]:checked'), (box) => box.value);
 }
 
-// Display and thumbnail JPEGs with the decoded size, or null when this browser cannot decode the photo.
-// A browser without createImageBitmap throws at the call, and such a photo gets no previews.
-async function derivatives(file: File): Promise<Derivatives | null> {
-  let bitmap: ImageBitmap | null = null;
-  try {
-    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-    const display = await encodeJpeg(bitmap, fitEdges(bitmap.width, bitmap.height, DISPLAY_EDGE));
-    const thumb = await encodeJpeg(bitmap, fitEdges(bitmap.width, bitmap.height, THUMB_EDGE));
-    return derivativesOf(bitmap.width, bitmap.height, display, thumb);
-  } catch {
-    return null;
-  } finally {
-    if (bitmap !== null) closeBitmap(bitmap);
-  }
-}
-
-// A JPEG of the bitmap at the given size, or null when this browser gives no 2D context.
-function encodeJpeg(bitmap: ImageBitmap, size: Size): Promise<Blob | null> {
-  const canvas = document.createElement('canvas');
-  canvas.width = size.width;
-  canvas.height = size.height;
-  const context = canvas.getContext('2d');
-  if (!context) return Promise.resolve(null);
-  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  return new Promise<Blob | null>((resolve) => { canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY); });
-}
-
-function closeBitmap(bitmap: ImageBitmap): void {
-  if (typeof bitmap.close === 'function') bitmap.close();
-}
-
+// The photo pipeline runs in photo-upload.ts. This page supplies its API client and shows each step on the photo's row.
 async function uploadPhoto(page: CapturePage, item: QueueItem): Promise<void> {
-  checkOriginalSize(item.file.size);
-  setItem(item, 'working', TEXT.reading);
-  const buffer = await item.file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const sha256 = hexOf(await crypto.subtle.digest('SHA-256', buffer));
-  const taken = takenAtOf(bytes, browserClock);
-  setItem(item, 'working', TEXT.previewing);
-  const derived = await derivatives(item.file);
-  const body = photoForm(item.file, sha256, taken, derived, page.state.memoryId);
-  setItem(item, 'working', TEXT.uploading);
-  const result = await api<UploadResult>(page, 'POST', '/api/media', body);
-  let media = result.media;
-  if (needsLink(result)) {
-    setItem(item, 'working', TEXT.linking);
-    // Both fields are required on every PATCH; the photo's current caption is sent back unchanged.
-    const linked = await api<MediaEnvelope>(page, 'PATCH', mediaPath(result.media.id), linkBody(result.media, page.state.memoryId));
-    media = linked.media;
-  }
-  item.mediaId = media.id;
+  const uploaded = await uploadPhotoFile(item.file, page.state.memoryId, {
+    api: <T>(method: string, path: string, body?: FormData | object) => api<T>(page, method, path, body),
+    onPhase: (phase, text) => { setItem(item, phase, text); },
+  });
+  item.mediaId = uploaded.media.id;
   item.done = true;
-  item.message = photoOutcome({ duplicate: result.duplicate, mediaMemoryId: media.memoryId, entryMemoryId: page.state.memoryId, derived });
+  item.message = uploaded.message;
   setItem(item, 'saved', item.message);
 }
 

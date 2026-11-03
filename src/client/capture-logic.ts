@@ -131,6 +131,13 @@ export interface Clock {
   localInstant(year: number, monthIndex: number, day: number, hour: number, minute: number): Date;
 }
 
+/** This browser's clock and time zone. The pages pass it to the functions above; the functions themselves never read it. */
+export const browserClock: Clock = {
+  now: () => new Date(),
+  offsetAt: (instant) => -instant.getTimezoneOffset(),
+  localInstant: (year, monthIndex, day, hour, minute) => new Date(year, monthIndex, day, hour, minute),
+};
+
 function pad2(value: number): string {
   return (value < 10 ? '0' : '') + value;
 }

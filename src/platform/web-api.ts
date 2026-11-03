@@ -74,6 +74,13 @@ const entryBody = jsonObject({
   // The capture page never sends null here, but null has always meant "no links" on this endpoint.
   relatedIds: relatedIdList.nullish(),
 });
+// An edit of an event. An absent occurredAt is stored as null (unknown time), as every write does; absent or null relatedIds mean no links.
+const entryEditBody = jsonObject({
+  expectedVersion: versionSchema,
+  text: memoryFields.text,
+  occurredAt: memoryFields.occurredAt,
+  relatedIds: relatedIdList.nullish(),
+});
 const mediaEditBody = jsonObject({ expectedVersion: versionSchema, ...mediaEditFields });
 const expectedVersionBody = jsonObject({ expectedVersion: versionSchema });
 
@@ -117,15 +124,37 @@ async function createEntry(request: Request, memories: MemoryService): Promise<R
   const memory = await memories.record({ kind: 'event', ...entry, relatedIds: relatedIds ?? undefined }, id);
   return ok({ memory: currentMemory(memory) }, 201);
 }
+async function listEntries(url: URL, memories: MemoryService): Promise<Response> {
+  const page = await memories.search({ afterId: url.searchParams.get('afterId') || undefined, limit: MAX_PAGE_LIMIT });
+  // The page is cut by ID before its events are picked out, so it can hold fewer events than the limit; the cursor still follows the whole page.
+  const items = page.filter((memory) => memory.kind === 'event').map(currentMemory);
+  return ok({ items, nextAfterId: page.length === MAX_PAGE_LIMIT ? page[page.length - 1].id : null });
+}
+async function updateEntry(request: Request, memories: MemoryService, id: string): Promise<Response> {
+  const { expectedVersion, text, occurredAt, relatedIds } = await jsonBody(request, entryEditBody);
+  // Only an event is edited here, so a person, place or fact at this ID is reported as missing, like an unknown ID.
+  if ((await memories.get(id))?.kind !== 'event') throw new MemoryError('NOT_FOUND', 'Entry not found');
+  const updated = await memories.correct(id, expectedVersion, { kind: 'event', text, occurredAt, relatedIds: relatedIds ?? undefined });
+  return ok({ memory: currentMemory(updated) });
+}
 async function relatedPeople(url: URL, memories: MemoryService): Promise<Response> {
   const page = await memories.search({ afterId: url.searchParams.get('afterId') || undefined, limit: MAX_PAGE_LIMIT });
   const items = page.filter((memory) => memory.kind === 'person' || memory.kind === 'place')
     .map((memory) => ({ id: memory.id, kind: memory.kind, text: [...memory.text].slice(0, SUMMARY_CHARS).join('') }));
   return ok({ items, nextAfterId: page.length === MAX_PAGE_LIMIT ? page[page.length - 1].id : null });
 }
+// The memory filter of GET /api/media: one memory's photos, the photos no memory holds (unlinked=1), or no filter at all.
+function memoryFilter(url: URL): { memoryId?: string | null } {
+  const memoryId = url.searchParams.get('memoryId') || undefined;
+  const unlinked = url.searchParams.getAll('unlinked');
+  if (unlinked.length === 0) return { memoryId };
+  if (unlinked.some((value) => value !== '1')) throw bad('unlinked must be 1');
+  if (memoryId !== undefined) throw bad('Use memoryId or unlinked, not both');
+  return { memoryId: null };
+}
 async function listMedia(url: URL, media: MediaService): Promise<Response> {
   const items = await media.list({
-    memoryId: url.searchParams.get('memoryId') || undefined,
+    ...memoryFilter(url),
     afterId: url.searchParams.get('afterId') || undefined,
     limit: MEDIA_PAGE,
   });
@@ -190,7 +219,14 @@ const defineRoute = (pattern: RegExp, handlers: Record<string, Handler>): Route 
 
 // Matched in this order. A path that matches without the request's method gets 405, and Allow lists its methods in the order written here.
 const routes: readonly Route[] = [
-  defineRoute(/^\/api\/entries$/, { POST: ({ request, memories }) => createEntry(request, memories) }),
+  defineRoute(/^\/api\/entries$/, {
+    POST: ({ request, memories }) => createEntry(request, memories),
+    GET: ({ url, memories }) => listEntries(url, memories),
+  }),
+  defineRoute(/^\/api\/entries\/([^/]+)$/, {
+    // The ID is parsed before the body is read, as for media.
+    PATCH: ({ request, memories }, [id]) => updateEntry(request, memories, parse(memoryIdSchema, id)),
+  }),
   defineRoute(/^\/api\/related$/, { GET: ({ url, memories }) => relatedPeople(url, memories) }),
   defineRoute(/^\/api\/media$/, {
     GET: ({ url, media }) => listMedia(url, media),

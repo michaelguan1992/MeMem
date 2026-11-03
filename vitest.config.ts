@@ -15,15 +15,16 @@ export default defineConfig({
       reporter: ['text-summary', 'lcov'],
       reportsDirectory: 'coverage',
       include: ['src/**/*.ts'],
-      // The browser's capture.ts is measured by the e2e run, which writes coverage/e2e/lcov.info. crapper keeps one
-      // report per file, so vitest must not list it too.
-      exclude: ['src/client/capture.ts'],
+      // The browser's capture.ts and photo-upload.ts are measured by the e2e run, which writes coverage/e2e/lcov.info.
+      // crapper keeps one report per file, so vitest must not list them too. history.ts is only exercised by e2e and has
+      // no coverage run.
+      exclude: ['src/client/capture.ts', 'src/client/photo-upload.ts', 'src/client/history.ts'],
     },
     projects: [
       {
         test: {
           name: 'core',
-          include: ['tests/memory.test.ts', 'tests/media.test.ts', 'tests/schema.test.ts', 'tests/mcp-tools.test.ts', 'tests/capture-client.test.ts', 'tests/capture-logic.test.ts', 'tests/owner-password.test.ts'],
+          include: ['tests/memory.test.ts', 'tests/media.test.ts', 'tests/schema.test.ts', 'tests/mcp-tools.test.ts', 'tests/capture-client.test.ts', 'tests/capture-logic.test.ts', 'tests/history-logic.test.ts', 'tests/owner-password.test.ts'],
           exclude: ['e2e/**'],
         },
       },

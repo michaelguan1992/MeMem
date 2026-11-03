@@ -3,6 +3,7 @@ import { env, SELF } from 'cloudflare:test';
 import schemaSql from '../migrations/d1/0001_memories.sql?raw';
 import mediaSql from '../migrations/d1/0002_media.sql?raw';
 import { captureScript } from '../src/generated/capture-script.ts';
+import { historyScript } from '../src/generated/history-script.ts';
 
 const origin = 'http://localhost:8787';
 const ownerPassphrase = 'test-only-owner-secret-never-used-in-production';
@@ -164,6 +165,7 @@ test('capture paths reject other methods with Allow', async () => {
   const cases = [
     ['PUT', '/capture', 'GET'],
     ['POST', '/capture', 'GET'],
+    ['PUT', '/capture/history', 'GET'],
     ['GET', '/capture/login', 'POST'],
     ['PUT', '/capture/logout', 'POST'],
   ] as const;
@@ -197,6 +199,7 @@ test('the signed-in capture page is the real form, with its script, manifest and
     '<link rel="apple-touch-icon" href="/capture-icon.svg">',
     '<script src="/capture.js" defer></script>',
     '<form id="capture-form" method="post" action="/capture" novalidate>',
+    '<p class="nav"><a href="/capture/history">Past entries</a></p>',
     '<textarea id="entry-text"',
     'type="datetime-local"',
     'accept="image/*" multiple',
@@ -265,9 +268,67 @@ test('capture static files are public, typed, and served with nosniff', async ()
   expect(await icon.text()).toContain('<svg');
 });
 
+test('GET /capture/history without a session shows the login page', async () => {
+  await migrate();
+  const response = await SELF.fetch(`${origin}/capture/history`);
+  expect(response.status).toBe(200);
+  expect(response.headers.get('content-security-policy')).toBe(loginCsp);
+  expect(response.headers.get('set-cookie')).toBeNull();
+  const html = await response.text();
+  expect(html).toContain('action="/capture/login"');
+  expect(html).not.toContain('csrf-token');
+  expect(html).not.toContain('/capture-history.js');
+  const stale = await SELF.fetch(`${origin}/capture/history`, { headers: { Cookie: `${cookieName}=not-a-session-token` } });
+  expect(await stale.text()).toContain('action="/capture/login"');
+});
+
+test('GET /capture/history with a session serves the past-entries page under the capture policy', async () => {
+  await migrate();
+  const { cookie } = await signIn();
+  const response = await SELF.fetch(`${origin}/capture/history`, { headers: { Cookie: cookie } });
+  expect(response.status).toBe(200);
+  expect(response.headers.get('content-security-policy')).toBe(captureCsp);
+  expect(response.headers.get('cache-control')).toBe('no-store');
+  const html = await response.text();
+  const csrf = csrfFrom(html);
+  expect(csrf).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  for (const expected of [
+    '<script src="/capture-history.js" defer></script>',
+    '<h1>Past entries</h1>',
+    '<p class="nav"><a href="/capture">New entry</a></p>',
+    '<p id="status" role="status" aria-live="polite"></p>',
+    '<ol id="entry-list" class="entries"></ol>',
+    '<section id="unlinked" class="unlinked" aria-labelledby="unlinked-heading">',
+    '<h2 id="unlinked-heading">Unlinked photos</h2>',
+    '<p id="unlinked-status" class="status-line" role="status" aria-live="polite"></p>',
+    '<div id="unlinked-list" class="unlinked-list"></div>',
+    'action="/capture/logout"',
+    `name="csrf" value="${csrf}"`,
+  ]) expect(html).toContain(expected);
+  expect(html).not.toContain('<script>');
+  expect(html).not.toContain(' onclick=');
+  expect(html).not.toContain(' style=');
+  expect(html).not.toContain('autocomplete="current-password"');
+});
+
+test('capture-history.js is public JavaScript that reads entries through the owner API only', async () => {
+  await migrate();
+  const script = await SELF.fetch(`${origin}/capture-history.js`);
+  expect(script.status).toBe(200);
+  expect(script.headers.get('content-type')).toBe('text/javascript; charset=utf-8');
+  expect(script.headers.get('x-content-type-options')).toBe('nosniff');
+  expect(script.headers.get('cache-control')).toBe('no-cache');
+  const source = await script.text();
+  expect(source).toBe(historyScript);
+  expect(source).toContain('/api/entries');
+  expect(source).not.toMatch(/innerHTML|insertAdjacentHTML|document\.write|eval\(/);
+  // A bundler helper such as esbuild's __name( would be undefined in the browser.
+  expect(source).not.toContain('__name(');
+});
+
 test('capture static files reject every method except GET', async () => {
   await migrate();
-  for (const path of ['/capture.js', '/capture.webmanifest', '/capture-icon.svg']) {
+  for (const path of ['/capture.js', '/capture-history.js', '/capture.webmanifest', '/capture-icon.svg']) {
     const response = await SELF.fetch(new Request(`${origin}${path}`, { method: 'POST', headers: { Origin: origin } }));
     expect(response.status).toBe(405);
     expect(response.headers.get('allow')).toBe('GET');

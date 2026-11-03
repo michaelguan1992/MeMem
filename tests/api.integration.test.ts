@@ -16,6 +16,8 @@ interface MediaRecord {
 }
 interface MediaPage { items: MediaRecord[]; nextAfterId: string | null }
 interface Related { items: { id: string; kind: string; text: string }[]; nextAfterId: string | null }
+interface Entry { id: string; kind: string; text: string; occurredAt: string | null; relatedIds: string[]; createdAt: string; updatedAt: string; version: number }
+interface Entries { items: Entry[]; nextAfterId: string | null }
 
 async function json<T = unknown>(response: Response): Promise<T> { return await response.json() as T; }
 async function migrate(): Promise<void> {
@@ -103,6 +105,8 @@ test('every /api request needs a session that belongs to the owner', async () =>
   const anonymous = [
     await SELF.fetch(request('GET', '/api/related', null)),
     await SELF.fetch(jsonRequest('POST', '/api/entries', null, { text: 'no session' })),
+    await SELF.fetch(request('GET', '/api/entries', null)),
+    await SELF.fetch(jsonRequest('PATCH', '/api/entries/entry-0001', null, { expectedVersion: 1, text: 'no session' })),
     await SELF.fetch(request('GET', '/api/media', null)),
   ];
   for (const response of anonymous) {
@@ -226,6 +230,118 @@ test('GET /api/related lists people and places only, with 200-character text and
   expect(second.items).toHaveLength(25);
   expect(second.nextAfterId).toBeNull();
   expect((await SELF.fetch(request('GET', '/api/related?afterId=bad%20id', auth))).status).toBe(400);
+});
+
+test('GET /api/entries lists events in full, without originalText, with ID paging and each owner kept apart', async () => {
+  await reset();
+  const auth = await signIn();
+  await createCloudflareMemory(env, 'mallory').record({ kind: 'event', text: 'another owner\'s event' });
+  // ent-0001..ent-0250: i % 4 === 2 is a person, i % 4 === 0 is a place, the rest are events. ent-0001 has a long text.
+  const longText = 'e'.repeat(1000);
+  const statements: D1PreparedStatement[] = [];
+  for (let i = 1; i <= 250; i++) {
+    const id = `ent-${String(i).padStart(4, '0')}`;
+    const kind = i % 4 === 0 ? 'place' : i % 4 === 2 ? 'person' : 'event';
+    const text = i === 1 ? longText : `${kind} ${i}`;
+    const memory = { id, kind, text, originalText: text, occurredAt: null, relatedIds: [], createdAt: '2026-10-09T12:00:00.000Z', updatedAt: '2026-10-09T12:00:00.000Z', version: 1 };
+    statements.push(env.DB.prepare('INSERT INTO memories (owner, id, payload, search_text, occurred_at, version) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind('owner', id, JSON.stringify(memory), text.toLowerCase(), null, 1));
+  }
+  await env.DB.batch(statements);
+
+  // The first 200 IDs form a full page, so it has a cursor, and its 100 events are listed in ID order.
+  const first = await json<Entries>(await SELF.fetch(request('GET', '/api/entries', auth)));
+  expect(first.items).toHaveLength(100);
+  expect(first.nextAfterId).toBe('ent-0200');
+  expect(first.items.every((item) => item.kind === 'event')).toBe(true);
+  // toEqual rejects any extra key, so originalText cannot appear, and the long text is returned whole.
+  expect(first.items[0]).toEqual({ id: 'ent-0001', kind: 'event', text: longText, occurredAt: null, relatedIds: [], createdAt: '2026-10-09T12:00:00.000Z', updatedAt: '2026-10-09T12:00:00.000Z', version: 1 });
+
+  // The 50 IDs after the cursor are a short page, so there is no further cursor. The other owner's event is in neither page.
+  const second = await json<Entries>(await SELF.fetch(request('GET', '/api/entries?afterId=ent-0200', auth)));
+  expect(second.items).toHaveLength(25);
+  expect(second.nextAfterId).toBeNull();
+  expect([...first.items, ...second.items]).toHaveLength(125);
+
+  const malformed = await SELF.fetch(request('GET', '/api/entries?afterId=bad%20id', auth));
+  expect(malformed.status).toBe(400);
+  expect(await json(malformed)).toEqual({ error: 'INVALID_INPUT', message: 'Invalid record identifier' });
+});
+
+test('PATCH /api/entries/<id> edits an event in place, moves its version on and keeps its first text as history', async () => {
+  await reset();
+  const auth = await signIn();
+  const matthew = (await createCloudflareMemory(env, 'owner').record({ kind: 'person', text: 'Matthew' })).id;
+  const id = await createEntry(auth, 'Lunch in Kyoto');
+
+  const edited = await SELF.fetch(jsonRequest('PATCH', `/api/entries/${id}`, auth, { expectedVersion: 1, text: 'Lunch with Matthew in Kyoto', occurredAt: '2026-04-03T12:30:00+09:00', relatedIds: [matthew] }));
+  expect(edited.status).toBe(200);
+  const { memory } = await json<{ memory: Entry }>(edited);
+  expect(memory).toEqual({ id, kind: 'event', text: 'Lunch with Matthew in Kyoto', occurredAt: '2026-04-03T03:30:00.000Z', relatedIds: [matthew], createdAt: expect.any(String), updatedAt: expect.any(String), version: 2 });
+
+  // A follow-up list shows the same record. The first text stays in storage as history, and the core still reads it.
+  expect(await json<Entries>(await SELF.fetch(request('GET', '/api/entries', auth)))).toEqual({ items: [memory], nextAfterId: null });
+  expect(await createCloudflareMemory(env, 'owner').get(id)).toMatchObject({ text: 'Lunch with Matthew in Kyoto', originalText: 'Lunch in Kyoto', version: 2 });
+});
+
+test('PATCH /api/entries/<id> stores an absent or null time and links as none, as POST does', async () => {
+  await reset();
+  const auth = await signIn();
+  const person = (await createCloudflareMemory(env, 'owner').record({ kind: 'person', text: 'Matthew' })).id;
+  const created = await SELF.fetch(jsonRequest('POST', '/api/entries', auth, { text: 'Trip', occurredAt: '2026-04-02T10:00:00+09:00', relatedIds: [person] }));
+  const { memory: { id } } = await json<{ memory: { id: string } }>(created);
+  const path = `/api/entries/${id}`;
+
+  // Leaving occurredAt and relatedIds out clears the time and the links.
+  const omitted = await SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 1, text: 'Trip, undated' }));
+  expect(omitted.status).toBe(200);
+  expect(await json(omitted)).toMatchObject({ memory: { occurredAt: null, relatedIds: [], version: 2 } });
+  expect(await createCloudflareMemory(env, 'owner').get(id)).toMatchObject({ occurredAt: null, relatedIds: [] });
+
+  // Explicit values set both, and explicit nulls clear both again.
+  const linked = await SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 2, text: 'Trip, dated', occurredAt: '2026-05-01T00:00:00Z', relatedIds: [person] }));
+  expect(await json(linked)).toMatchObject({ memory: { occurredAt: '2026-05-01T00:00:00.000Z', relatedIds: [person], version: 3 } });
+  const nulled = await SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 3, text: 'Trip, dated', occurredAt: null, relatedIds: null }));
+  expect(await json(nulled)).toMatchObject({ memory: { occurredAt: null, relatedIds: [], version: 4 } });
+});
+
+test('PATCH /api/entries/<id> refuses unsafe, malformed, stale, foreign and non-event requests and changes nothing', async () => {
+  await reset();
+  const auth = await signIn();
+  const id = await createEntry(auth, 'Kyoto');
+  const person = (await createCloudflareMemory(env, 'owner').record({ kind: 'person', text: 'Matthew' })).id;
+  const foreign = (await createCloudflareMemory(env, 'mallory').record({ kind: 'event', text: 'another owner\'s event' })).id;
+  const path = `/api/entries/${id}`;
+  const body = { expectedVersion: 1, text: 'Kyoto, edited' };
+
+  // The CSRF check runs before the entry is read.
+  const noToken = await SELF.fetch(jsonRequest('PATCH', path, { ...auth, csrf: '' }, body));
+  expect(noToken.status).toBe(403);
+  expect(await json(noToken)).toEqual({ error: 'forbidden', message: 'Request origin or CSRF token check failed' });
+
+  // A body names only the fields this endpoint takes, and its text must contain something.
+  expect(await json(await SELF.fetch(jsonRequest('PATCH', path, auth, { ...body, kind: 'person' })))).toEqual({ error: 'INVALID_INPUT', message: 'Request body has an unknown field' });
+  expect(await json(await SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 1, text: '   ' })))).toEqual({ error: 'INVALID_INPUT', message: 'Text must contain 1–20000 characters' });
+
+  // The ID is checked before the body is read, so a malformed body is not the error reported.
+  const badId = await SELF.fetch(request('PATCH', '/api/entries/bad%20id', auth, '{"text":', { 'Content-Type': 'application/json' }));
+  expect(await json(badId)).toEqual({ error: 'INVALID_INPUT', message: 'Invalid record identifier' });
+
+  // A person, another owner's event and an unknown ID all read as missing.
+  for (const missing of [person, foreign, 'no-such-entry']) {
+    const response = await SELF.fetch(jsonRequest('PATCH', `/api/entries/${missing}`, auth, body));
+    expect({ missing, status: response.status, body: await json(response) }).toEqual({ missing, status: 404, body: { error: 'NOT_FOUND', message: 'Entry not found' } });
+  }
+  expect(await createCloudflareMemory(env, 'owner').get(id)).toMatchObject({ text: 'Kyoto', version: 1 });
+
+  // The first edit with the current version saves; sending that same version again is stale.
+  expect((await SELF.fetch(jsonRequest('PATCH', path, auth, body))).status).toBe(200);
+  const stale = await SELF.fetch(jsonRequest('PATCH', path, auth, body));
+  expect(stale.status).toBe(409);
+  expect(await json(stale)).toEqual({ error: 'CONFLICT', message: 'Record has changed; read the latest version' });
+  expect(await createCloudflareMemory(env, 'owner').get(id)).toMatchObject({ text: 'Kyoto, edited', version: 2 });
+  expect(await createCloudflareMemory(env, 'owner').get(person)).toMatchObject({ kind: 'person', text: 'Matthew', version: 1 });
+  expect(await createCloudflareMemory(env, 'mallory').get(foreign)).toMatchObject({ text: 'another owner\'s event', version: 1 });
 });
 
 test('a photo upload stores D1 metadata and three R2 objects, and every variant is served back unchanged', async () => {
@@ -413,6 +529,66 @@ test('a failed photo unlink fails the forget, and a retry finishes it', async ()
   expect(listed.items).toMatchObject([{ id: photoId, memoryId: null }]);
 });
 
+test('GET /api/media?unlinked=1 lists this owner\'s photos that no memory holds, and a photo moves in and out of it as it is unlinked and linked', async () => {
+  await reset();
+  const auth = await signIn();
+  const memoryId = await createEntry(auth, 'Kyoto');
+  const linked = await uploadPhoto(auth, { original: file(jpeg('unlinked-linked')), memoryId });
+  const loose = await uploadPhoto(auth, { original: file(jpeg('unlinked-loose')) });
+  await createCloudflareMedia(env, 'mallory').upload({ original: jpeg('unlinked-foreign'), sha256: await sha256(jpeg('unlinked-foreign')) });
+  const unlinked = async () => json<MediaPage>(await SELF.fetch(request('GET', '/api/media?unlinked=1', auth)));
+  const setMemory = (id: string, expectedVersion: number, target: string | null) => SELF.fetch(jsonRequest('PATCH', `/api/media/${id}`, auth, { expectedVersion, memoryId: target, caption: null }));
+
+  // The linked photo and another owner's photo are left out; the answer has no further cursor.
+  expect(await unlinked()).toEqual({ items: [loose], nextAfterId: null });
+
+  // Unlinking the linked photo lists it, and linking it again takes it back out of the list.
+  expect((await setMemory(linked.id, 1, null)).status).toBe(200);
+  expect((await unlinked()).items.map((item) => item.id).sort()).toEqual([linked.id, loose.id].sort());
+  expect((await setMemory(linked.id, 2, memoryId)).status).toBe(200);
+  expect((await unlinked()).items.map((item) => item.id)).toEqual([loose.id]);
+
+  // The list needs a session, like every other /api request.
+  expect((await SELF.fetch(request('GET', '/api/media?unlinked=1', null))).status).toBe(401);
+});
+
+test('GET /api/media?unlinked=1 pages by ID over unlinked photos only, so a linked photo takes no place in a page', async () => {
+  await reset();
+  const auth = await signIn();
+  const memoryId = await createEntry(auth, 'Kyoto');
+  // 51 unlinked photos and one linked photo: a full page of 50 unlinked photos has a cursor, and the last one follows it.
+  await uploadPhoto(auth, { original: file(jpeg('page-linked')), memoryId });
+  for (let i = 0; i < 51; i++) await uploadPhoto(auth, { original: file(jpeg(`page-loose-${i}`)) });
+  const first = await json<MediaPage>(await SELF.fetch(request('GET', '/api/media?unlinked=1', auth)));
+  expect(first.items).toHaveLength(50);
+  expect(first.items.every((item) => item.memoryId === null)).toBe(true);
+  expect(first.nextAfterId).toBe(first.items[49].id);
+  const next = await json<MediaPage>(await SELF.fetch(request('GET', `/api/media?unlinked=1&afterId=${first.nextAfterId}`, auth)));
+  expect(next.items).toHaveLength(1);
+  expect(next.items[0].memoryId).toBeNull();
+  expect(next.nextAfterId).toBeNull();
+});
+
+test('GET /api/media refuses an unlinked value other than 1, and unlinked together with a memory', async () => {
+  await reset();
+  const auth = await signIn();
+  const memoryId = await createEntry(auth, 'Kyoto');
+  const rejected: [string, string][] = [
+    ['unlinked=0', 'unlinked must be 1'],
+    ['unlinked=', 'unlinked must be 1'],
+    ['unlinked=true', 'unlinked must be 1'],
+    ['unlinked=0&unlinked=1', 'unlinked must be 1'],
+    [`unlinked=1&memoryId=${memoryId}`, 'Use memoryId or unlinked, not both'],
+    ['unlinked=1&memoryId=no-such-memory', 'Use memoryId or unlinked, not both'],
+  ];
+  for (const [query, message] of rejected) {
+    const response = await SELF.fetch(request('GET', `/api/media?${query}`, auth));
+    expect({ query, status: response.status, body: await json(response) }).toEqual({ query, status: 400, body: { error: 'INVALID_INPUT', message } });
+  }
+  // An empty memoryId names no memory, so unlinked=1 with it is the unlinked list.
+  expect(await json(await SELF.fetch(request('GET', '/api/media?unlinked=1&memoryId=', auth)))).toEqual({ items: [], nextAfterId: null });
+});
+
 test('unknown routes and wrong methods get JSON errors, with Allow where it applies', async () => {
   await reset();
   const auth = await signIn();
@@ -422,11 +598,12 @@ test('unknown routes and wrong methods get JSON errors, with Allow where it appl
   expect((await SELF.fetch(request('GET', '/api/media/abc/raw', auth))).status).toBe(404);
 
   const wrongMethods: [string, string, string][] = [
-    ['GET', '/api/entries', 'POST'],
-    ['PUT', '/api/entries', 'POST'],
+    ['PUT', '/api/entries', 'POST, GET'],
     ['POST', '/api/related', 'GET'],
     ['PATCH', '/api/media', 'GET, POST'],
     ['GET', '/api/media/abc', 'PATCH, DELETE'],
+    ['GET', '/api/entries/abc', 'PATCH'],
+    ['DELETE', '/api/entries/abc', 'PATCH'],
     ['POST', '/api/media/abc/original', 'GET'],
   ];
   for (const [method, path, allow] of wrongMethods) {
