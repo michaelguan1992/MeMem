@@ -30,7 +30,7 @@ The setup script generates a 256-bit owner passphrase. It saves the passphrase t
 
 `npm run dev` uses local Miniflare D1, KV, and R2 bindings. Apply the local D1 migrations (`0001_memories.sql`, `0002_media.sql`) with `npx wrangler d1 migrations apply memem --local`; the local resource URL is `http://localhost:8787/mcp`. Loopback HTTP is accepted only for local development.
 
-## Photo diary capture (deployed; production sign-in and upload not yet verified)
+## Photo diary capture (deployed; the owner reported it working on a phone)
 
 Open `http://localhost:8787/capture`, sign in with the owner passphrase, write what happened, pick photos and related people or places, and save. The browser reads the JPEG EXIF capture time to prefill the date, creates display (1600 px) and thumbnail (400 px) JPEG copies, and uploads each photo with its SHA-256; the Worker checks the file type by magic bytes, size limits, and the hash, and skips duplicates. Sessions last seven days in a `__Host-` HttpOnly SameSite=Strict cookie; every write needs a same-origin request and a CSRF token. Deleting a memory unlinks its photos without deleting them. Where the browser has speech recognition, a Dictate button (Chinese or English, remembered per browser) turns speech into text at the caret; the browser's own speech service does the recognition (Chrome sends the audio to Google), and the button is hidden where the browser has none. The page has a web app manifest so it can be added to a phone's home screen. Design: `docs/diary-recall-design.md`.
 
