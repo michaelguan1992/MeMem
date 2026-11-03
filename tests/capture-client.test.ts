@@ -1,7 +1,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { captureScript } from '../src/platform/capture-client.ts';
-import { readJpegTakenAt } from '../src/platform/exif.ts';
+import { captureScript } from '../src/generated/capture-script.ts';
+import { readJpegTakenAt } from '../src/client/exif.ts';
 
 const ascii = (text: string): number[] => [...text].map((char) => char.charCodeAt(0));
 function u16(value: number, little: boolean): number[] {
@@ -126,22 +126,9 @@ test('random bytes after a JPEG signature return null or a well-formed time, and
   }
 });
 
-test('the browser script embeds the EXIF reader verbatim and compiles as a classic script', () => {
-  const start = captureScript.indexOf('function readJpegTakenAt(');
-  const end = captureScript.indexOf('\n\n  var DISPLAY_EDGE');
-  assert.ok(start > 0 && end > start, 'the embedded EXIF reader is missing');
-  const embedded = captureScript.slice(start, end);
-  assert.equal(embedded, readJpegTakenAt.toString());
+test('the bundled browser script is one classic-script IIFE with no module syntax', () => {
   assert.doesNotThrow(() => new Function(captureScript));
-});
-
-test('the embedded EXIF reader still works when evaluated alone, without this module', () => {
-  const start = captureScript.indexOf('function readJpegTakenAt(');
-  const end = captureScript.indexOf('\n\n  var DISPLAY_EDGE');
-  const standalone = new Function(`return (${captureScript.slice(start, end)});`)() as typeof readJpegTakenAt;
-  const bytes = jpeg(tiffBlock({ little: true, dateTime: '2025:05:01 14:30:00', zone: '+09:00' }));
-  assert.equal(standalone(bytes, 480), '2025-05-01T14:30:00+09:00');
-  assert.equal(standalone(new Uint8Array([1, 2, 3]), 480), null);
+  assert.doesNotMatch(captureScript, /^\s*(import|export)\b/m);
 });
 
 test('the browser script writes server and photo data with textContent, never innerHTML', () => {

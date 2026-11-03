@@ -7,11 +7,17 @@
     "node": ">=24"
   },
   "scripts": {
+    "pretest": "npm run build:client",
     "test": "vitest run",
+    "pretest:core": "npm run build:client",
     "test:core": "vitest run --project core",
+    "pretest:worker": "npm run build:client",
     "test:worker": "vitest run --project worker",
+    "precoverage": "npm run build:client",
     "coverage": "vitest run --coverage",
+    "precheck": "npm run build:client",
     "check": "tsc --noEmit",
+    "build:client": "node scripts/build-client.mjs",
     "demo": "node examples/local.ts",
     "dev": "wrangler dev",
     "deploy": "bash scripts/deploy-cloudflare.sh",
@@ -30,6 +36,7 @@
     "@modelcontextprotocol/client-current": "npm:@modelcontextprotocol/client@^2.3.1",
     "@types/node": "^26.6.5",
     "@vitest/coverage-v8": "4.1.11",
+    "esbuild": "0.28.2",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.149.0"

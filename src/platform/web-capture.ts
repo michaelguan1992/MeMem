@@ -1,5 +1,5 @@
 import type { D1Binding } from '../storage/d1.ts';
-import { captureScript } from './capture-client.ts';
+import { captureScript } from '../generated/capture-script.ts';
 import { htmlEscape, PayloadTooLargeError, readBoundedForm, sameOriginPost } from './http.ts';
 import { verifyOwnerPassword } from './owner-password.ts';
 import { checkCsrf, clearSessionCookie, createSession, destroySession, readSession, SESSION_MAX_AGE_SECONDS, sessionCookie, type WebSession } from './web-session.ts';

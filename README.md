@@ -9,6 +9,7 @@ The Worker and full OAuth/MCP flow are covered by local Miniflare integration te
 - `src/core/` contains the platform-independent memory rules and `MemoryStore` interface, plus the photo rules in `media.ts` behind separate `MediaStore` and `BlobStore` interfaces.
 - `src/storage/` contains local SQLite and D1 adapters for memories and photo metadata.
 - `src/platform/` composes the core for Cloudflare: the R2 photo store, the `/capture` web page and its owner-passphrase session, and the session-protected `/api/*` JSON and upload endpoints.
+- `src/client/` holds the `/capture` browser script and the JPEG EXIF reader, both in TypeScript. `npm run build:client` (esbuild) bundles them into the gitignored `src/generated/`, and `check`, `test`, `coverage`, `dev`, and `deploy` run it automatically.
 - `src/mcp/tools.ts` defines strict `record_memory`, `search_memories`, `get_memory`, `correct_memory`, and `forget_memory` tools.
 - `src/worker.ts` serves stateless Streamable HTTP at `/mcp` and OAuth 2.1 authorization, discovery, refresh, and dynamic client registration through the official Cloudflare OAuth provider.
 - D1 stores memory records, photo metadata, and hashed web sessions. The private R2 binding `MEDIA` stores photo files (original plus browser-generated display and thumbnail copies). The separate `OAUTH_KV` binding stores OAuth clients, grants, consent handles, and tokens.

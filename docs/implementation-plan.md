@@ -32,8 +32,9 @@ Design: `docs/diary-recall-design.md`. Implementation followed AGENTS.md roles: 
 - [x] Phase 1, task 2: `/capture` owner-passphrase login with hashed D1 sessions, `__Host-` HttpOnly SameSite=Strict cookie, CSRF token, logout.
 - [x] Phase 1, task 3: session-protected `/api/entries`, `/api/related`, `/api/media` upload/list/patch/delete/read; deleting a memory (including via MCP `forget_memory`) unlinks its photos best-effort.
 - [x] Phase 1, task 4: capture page, browser EXIF time prefill, client-side display/thumbnail generation, per-photo status and retry, web app manifest, strict CSP.
-- [x] Local checks: `npm run check` passes; `npm test` passes (43 core tests, 24 Worker integration tests across 3 files).
+- [x] Local checks: `npm run check` passes; `npm test` passes (42 core tests, 24 Worker integration tests across 3 files).
 - [x] Local browser check against `wrangler dev` (Miniflare D1/R2): sign-in, entry creation, photo upload, all three R2 variants read back with correct sizes, mobile/dark layout, logout. This found and fixed a bug the integration tests missed: `Referrer-Policy: no-referrer` made the browser send `Origin: null`, so the capture pages now use `same-origin`.
+- [x] Refactor: the `/capture` browser script is TypeScript in `src/client/` (EXIF reader split into small functions) and is built by `npm run build:client` (esbuild) into the gitignored `src/generated/`; `check`, `test`, `coverage`, `dev`, and `deploy` run it automatically. Verified with `npm run check`, `npm test` (66 tests), and a local browser upload against `wrangler dev` (all three variants read back at the expected sizes).
 - [ ] Not verified: iPhone Safari/home-screen install, HEIC photos, real EXIF photos in a browser, large photos' memory use. Not deployed: needs the R2 bucket `memem-media`, an R2 permission on the deployment token, the `0002` migration, and a decision on login rate limiting.
 - [ ] Phase 2: recall pages and MCP tools (`list_media`, `create_recall`, …).
 

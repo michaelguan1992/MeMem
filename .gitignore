@@ -10,3 +10,4 @@ node_modules/
 coverage/
 .metrics/
 target/
+src/generated/

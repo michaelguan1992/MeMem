@@ -2,6 +2,7 @@ import { test, expect } from 'vitest';
 import { env, SELF } from 'cloudflare:test';
 import schemaSql from '../migrations/d1/0001_memories.sql?raw';
 import mediaSql from '../migrations/d1/0002_media.sql?raw';
+import { captureScript } from '../src/generated/capture-script.ts';
 
 const origin = 'http://localhost:8787';
 const ownerPassphrase = 'test-only-owner-secret-never-used-in-production';
@@ -230,8 +231,9 @@ test('capture static files are public, typed, and served with nosniff', async ()
   expect(script.headers.get('x-content-type-options')).toBe('nosniff');
   expect(script.headers.get('cache-control')).toBe('no-cache');
   const source = await script.text();
-  expect(source).toContain('function readJpegTakenAt(');
-  // A bundler helper inside the embedded EXIF reader would be undefined in the browser.
+  expect(source).toBe(captureScript);
+  expect(source).toContain('/api/media');
+  // A bundler helper such as esbuild's __name( would be undefined in the browser.
   expect(source).not.toContain('__name(');
 
   const manifest = await SELF.fetch(`${origin}/capture.webmanifest`);
