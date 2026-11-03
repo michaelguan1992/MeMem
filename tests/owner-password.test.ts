@@ -1,0 +1,44 @@
+import { test } from 'vitest';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { verifyOwnerPassword } from '../src/platform/owner-password.ts';
+
+// Test-only passphrase and salt. The verifier is built the way scripts/setup-secrets.mjs builds one: SHA-256 over the
+// 16-byte salt followed by the passphrase, with the salt and digest in base64url.
+const PASSPHRASE = 'owner-password-test-only-passphrase';
+const SALT_TEXT = Buffer.from('0123456789abcdef').toString('base64url');
+const DIGEST_TEXT = createHash('sha256').update(Buffer.from(SALT_TEXT, 'base64url')).update(PASSPHRASE, 'utf8').digest('base64url');
+const dollarForm = `sha256-v1$${SALT_TEXT}$${DIGEST_TEXT}`;
+const dotForm = `sha256-v1.${SALT_TEXT}.${DIGEST_TEXT}`;
+
+test('the $ form that is already deployed still verifies the passphrase', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, dollarForm), true);
+});
+
+test('the . form verifies the same passphrase', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, dotForm), true);
+});
+
+test('a wrong passphrase fails in the $ form', async () => {
+  assert.equal(await verifyOwnerPassword('not the owner passphrase', dollarForm), false);
+});
+
+test('a wrong passphrase fails in the . form', async () => {
+  assert.equal(await verifyOwnerPassword('not the owner passphrase', dotForm), false);
+});
+
+test('a verifier that mixes the two separators is rejected in either order', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1$${SALT_TEXT}.${DIGEST_TEXT}`), false);
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${SALT_TEXT}$${DIGEST_TEXT}`), false);
+});
+
+test('extra parts are rejected in both forms', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `${dollarForm}$extra`), false);
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `${dotForm}.extra`), false);
+});
+
+test('a missing part, an unknown version or a wrong-length salt is rejected', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${SALT_TEXT}`), false);
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v2.${SALT_TEXT}.${DIGEST_TEXT}`), false);
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${DIGEST_TEXT}.${DIGEST_TEXT}`), false);
+});

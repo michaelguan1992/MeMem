@@ -15,7 +15,8 @@ chmodSync(secretDirectory, 0o700);
 const passphrase = randomBytes(32).toString('base64url');
 const salt = randomBytes(16);
 const digest = createHash('sha256').update(salt).update(passphrase, 'utf8').digest();
-const passwordHash = `sha256-v1$${salt.toString('base64url')}$${digest.toString('base64url')}`;
+// The `.` separator survives an env file: `$` would be expanded by dotenv. The Worker accepts the older `$` form too.
+const passwordHash = `sha256-v1.${salt.toString('base64url')}.${digest.toString('base64url')}`;
 
 function writePrivate(path, contents) {
   writeFileSync(path, contents, { mode: 0o600, flag: 'wx' });

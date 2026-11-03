@@ -23,6 +23,7 @@
     "src/**/*.ts",
     "tests/**/*.ts",
     "examples/**/*.ts",
+    "e2e/**/*.ts",
     "vitest.config.ts"
   ]
 }

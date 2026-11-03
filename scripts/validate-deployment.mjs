@@ -40,6 +40,7 @@ if ((secretFileStat.mode & 0o777) !== 0o600 || (passphraseStat.mode & 0o777) !==
   throw new Error('Secure owner credentials must have a 0700 .secrets directory and 0600 files; rerun setup after correcting permissions.');
 }
 const passwordHash = readFileSync(hashPath, 'utf8').trim();
-if (!/^sha256-v1\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{43}$/.test(passwordHash)) throw new Error('The owner password hash file has an invalid format.');
+// `$` (deployed form) or `.` (written by setup-secrets now). The backreference keeps one separator per value.
+if (!/^sha256-v1([$.])[A-Za-z0-9_-]{22}\1[A-Za-z0-9_-]{43}$/.test(passwordHash)) throw new Error('The owner password hash file has an invalid format.');
 
 console.log('Production config, HTTPS audience, D1/KV IDs, and local secret permissions are valid.');
