@@ -102,6 +102,7 @@ const item = (id: string, kind: RelatedItem['kind'], text: string): RelatedItem 
 test('wallTimeOf writes the local date and time with two digits in each field', () => {
   assert.equal(wallTimeOf(new Date(2025, 0, 2, 3, 4)), '2025-01-02T03:04');
   assert.equal(wallTimeOf(new Date(2025, 11, 31, 23, 59)), '2025-12-31T23:59');
+  assert.equal(wallTimeOf(new Date(2025, 9, 10, 10, 10)), '2025-10-10T10:10');
 });
 
 test('currentWall reads the current time from the clock', () => {
@@ -160,6 +161,11 @@ test('takenAtOf keeps the photo offset, and otherwise uses the browser offset fo
 test('takenAtOf asks for the offset that applied on the photo date, not the one in force today', () => {
   const summerNow = zoneClock((instant) => (instant.getUTCMonth() >= 2 && instant.getUTCMonth() <= 9 ? 600 : 480), new Date(Date.UTC(2025, 6, 1)));
   assert.equal(takenAtOf(exifJpeg('2025:01:15 10:00:00'), summerNow), '2025-01-15T10:00:00+08:00');
+});
+
+test('takenAtOf reads the four-digit year, so the browser offset is the one for that year', () => {
+  const byYear = zoneClock((instant) => (instant.getFullYear() === 2025 ? 480 : 0), new Date(Date.UTC(2025, 6, 1)));
+  assert.equal(takenAtOf(exifJpeg('2025:01:15 10:00:00'), byYear), '2025-01-15T10:00:00+08:00');
 });
 
 test('ownOffsetOf returns the photo own offset, or null when the photo has none', () => {
@@ -475,6 +481,7 @@ test('pendingOf and doneOf split a queue by its done flag, and keep the order', 
 
 test('pendingNotice names the photos that did not upload, and is null when none are left', () => {
   assert.equal(pendingNotice(0), null);
+  assert.equal(pendingNotice(1), 'The entry is saved, but 1 photo(s) did not upload. Press Retry photos to try them again.');
   assert.equal(pendingNotice(2), 'The entry is saved, but 2 photo(s) did not upload. Press Retry photos to try them again.');
 });
 

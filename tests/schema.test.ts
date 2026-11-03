@@ -1,6 +1,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { instantSchema, mediaEdit, mediaUpload, mediaVariantSchema, memoryIdSchema, memoryInput, memoryQuery, parse, sha256Schema, versionSchema, type MediaId, type MemoryId } from '../src/core/schema.ts';
+import { z } from 'zod';
+import { instantSchema, mediaEdit, mediaUpload, mediaVariantSchema, memoryIdSchema, memoryInput, memoryQuery, parse, parseStored, sha256Schema, versionSchema, type MediaId, type MemoryId } from '../src/core/schema.ts';
 import { instantOf, mediaIdOf, memoryIdOf, sha256Of } from './brands.ts';
 
 const MiB = 1024 * 1024;
@@ -45,4 +46,26 @@ test('timestamps are stored in UTC, and related IDs are kept once in their first
   const first = memoryIdOf('a'), second = memoryIdOf('b');
   const content = parse(memoryInput, { kind: 'fact', text: 'x', relatedIds: [second, second, first] });
   assert.deepEqual(content, { kind: 'fact', text: 'x', occurredAt: null, relatedIds: [second, first] });
+});
+
+test('a field that is missing from an edit names both required fields', () => {
+  rejected(() => parse(mediaEdit, { caption: null }), 'memoryId and caption are both required; send null to clear');
+});
+
+test('an ISO base-media file is a photo only when its brand is a HEIF brand', () => {
+  const otherBrand = Buffer.from('\x00\x00\x00\x18ftypisom\x00\x00\x00\x00', 'latin1');
+  const noFtypBox = Buffer.from('\x00\x00\x00\x18xxxxheicheic pixels', 'latin1');
+  rejected(() => parse(mediaUpload, { original: otherBrand, sha256: sha256Of('a'.repeat(64)) }), 'Original photo has an unsupported format');
+  rejected(() => parse(mediaUpload, { original: noFtypBox, sha256: sha256Of('a'.repeat(64)) }), 'Original photo has an unsupported format');
+});
+
+test('a one-byte photo is within the size rule, so it fails on its format', () => {
+  rejected(() => parse(mediaUpload, { original: new Uint8Array(1), sha256: sha256Of('a'.repeat(64)) }), 'Original photo has an unsupported format');
+});
+
+test('a stored value that breaks a rule is reported with that rule message', () => {
+  assert.throws(
+    () => parseStored(z.object({ text: z.string({ error: 'Text must be a string' }) }), { text: 1 }, 'memory row'),
+    { message: 'Corrupt memory row in storage: Text must be a string' },
+  );
 });

@@ -26,7 +26,7 @@ export async function readBoundedBytes(request: Request, maximumBytes: number): 
   return body;
 }
 export async function readBoundedForm(request: Request, maximumBytes: number): Promise<URLSearchParams> {
-  const type = request.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+  const type = request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
   if (type !== 'application/x-www-form-urlencoded') throw new Error('Expected URL-encoded form data');
   return new URLSearchParams(new TextDecoder().decode(await readBoundedBytes(request, maximumBytes)));
 }

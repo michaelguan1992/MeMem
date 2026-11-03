@@ -28,6 +28,14 @@ function rowsWithText(text: string) {
   return query<{ id: string; occurred_at: string | null }>(`SELECT id, occurred_at FROM memories WHERE owner = 'owner' AND search_text = ${sqlString(text.toLowerCase())}`);
 }
 
+/** The status line shows this text, and it is styled as an error only when `error` is set. */
+async function expectStatus(page: Page, text: string, error: boolean): Promise<void> {
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(text);
+  if (error) await expect(status).toHaveClass('error');
+  else await expect(status).not.toHaveClass(/error/);
+}
+
 test('a wrong passphrase is refused, and the right one opens the capture form', async ({ page }) => {
   await page.goto('/capture');
   await page.getByLabel('Owner passphrase').fill('not the owner passphrase');
@@ -54,7 +62,8 @@ test('a photo sets the When field from its EXIF time, and the saved photo keeps 
   ]);
   // The page sends the EXIF time with the photo's own offset.
   expect(entryRequest.postDataJSON()).toMatchObject({ occurredAt: '2024-05-01T14:30:00+09:00' });
-  await expect(page.getByRole('status')).toHaveText('Saved.');
+  await expectStatus(page, 'Saved.', false);
+  await expect(page.getByRole('button', { name: SAVE_BUTTON })).toBeEnabled();
 
   const thumbnail = page.locator('#saved-photos img');
   await expect(thumbnail).toHaveCount(1);
@@ -96,10 +105,10 @@ test('a save whose response is lost is retried, and the entry is stored once', a
 
   await page.getByLabel('What happened?', { exact: true }).fill(text);
   await page.getByRole('button', { name: SAVE_BUTTON }).click();
-  await expect(page.getByRole('status')).toHaveText(UNREACHABLE);
+  await expectStatus(page, UNREACHABLE, true);
 
   await page.getByRole('button', { name: SAVE_BUTTON }).click();
-  await expect(page.getByRole('status')).toHaveText('Saved.');
+  await expectStatus(page, 'Saved.', false);
   expect(await rowsWithText(text)).toHaveLength(1);
 });
 
@@ -119,7 +128,10 @@ test('a person saved through the API is listed under People and places, and is s
     page.getByRole('button', { name: SAVE_BUTTON }).click(),
   ]);
   expect(request.postDataJSON()).toMatchObject({ text, relatedIds: [personId] });
-  await expect(page.getByRole('status')).toHaveText('Saved.');
+  await expectStatus(page, 'Saved.', false);
+  // The save clears the entry for the next one, and unticks the person it used.
+  await expect(page.getByLabel('What happened?', { exact: true })).toHaveValue('');
+  await expect(page.getByLabel(name, { exact: true })).not.toBeChecked();
 });
 
 test('logging out returns to the sign-in page, and the API then refuses the session', async ({ page }) => {
@@ -155,6 +167,75 @@ test.describe('a phone-sized screen', () => {
 
     await page.getByLabel('What happened?', { exact: true }).fill(uniqueText('Note on the phone'));
     await page.getByRole('button', { name: SAVE_BUTTON }).click();
-    await expect(page.getByRole('status')).toHaveText('Saved.');
+    await expectStatus(page, 'Saved.', false);
   });
+});
+
+test('an empty first entry is refused before anything is sent', async ({ page }) => {
+  await signIn(page);
+  const posted: string[] = [];
+  page.on('request', (request) => { if (request.url().endsWith('/api/entries')) posted.push(request.method()); });
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expectStatus(page, 'Write a few words about the moment first.', true);
+  await expect(page.getByLabel('What happened?', { exact: true })).toBeFocused();
+  expect(posted).toEqual([]);
+});
+
+test('a related list that fails to load says so', async ({ page }) => {
+  await page.route('**/api/related', (route) => route.fulfill({ status: 500, body: '' }));
+  await signIn(page);
+  await expect(page.locator('#related-list')).toHaveText('Could not load people and places. Request failed (HTTP 500).');
+});
+
+test('with no people or places saved, the related list says so', async ({ page }) => {
+  await page.route('**/api/related', (route) => route.fulfill({ json: { items: [], nextAfterId: null } }));
+  await signIn(page);
+  await expect(page.locator('#related-list')).toHaveText('No people or places saved yet.');
+});
+
+test('a photo that fails to upload stays waiting, and the save says so', async ({ page }) => {
+  const text = uniqueText('Photo that fails');
+  await signIn(page);
+  await page.route('**/api/media', (route) => route.abort());
+  await page.getByLabel('Photos', { exact: true }).setInputFiles(EXIF_PHOTO);
+  await page.getByLabel('What happened?', { exact: true }).fill(text);
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expectStatus(page, 'The entry is saved, but 1 photo(s) did not upload. Press Retry photos to try them again.', true);
+  await expect(page.getByRole('button', { name: 'Retry photos' })).toBeEnabled();
+  expect(await rowsWithText(text)).toHaveLength(1);
+});
+
+test('a file that is not a JPEG leaves the When field at the current time', async ({ page }) => {
+  await signIn(page);
+  await page.getByLabel('Photos', { exact: true }).setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('not a photo') });
+  await expect(page.getByLabel('When', { exact: true })).toHaveValue(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+});
+
+test('a photo the browser cannot decode is saved without previews', async ({ page }) => {
+  const text = uniqueText('Phone photo');
+  await signIn(page);
+  // An HEIC container. The server accepts it by its magic bytes, and Chrome cannot decode it, so the page makes no previews.
+  const heic = Buffer.from([0, 0, 0, 0x10, ...Buffer.from('ftypheic'), 0, 0, 0, 0]);
+  await page.getByLabel('Photos', { exact: true }).setInputFiles({ name: 'phone.heic', mimeType: 'image/heic', buffer: heic });
+  await page.getByLabel('What happened?', { exact: true }).fill(text);
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expectStatus(page, 'Saved.', false);
+  await expect(page.locator('#saved-photos figcaption')).toHaveText('Saved without a preview');
+  expect(await rowsWithText(text)).toHaveLength(1);
+});
+
+test('while a save is in progress the form is locked and says so', async ({ page }) => {
+  await signIn(page);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = () => { resolve(); }; });
+  await page.route('**/api/entries', async (route) => {
+    await held;
+    await route.continue();
+  });
+  await page.getByLabel('What happened?', { exact: true }).fill(uniqueText('Held save'));
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expectStatus(page, 'Saving…', false);
+  await expect(page.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+  release();
+  await expectStatus(page, 'Saved.', false);
 });

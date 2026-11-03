@@ -1,6 +1,8 @@
 import { test, expect } from 'vitest';
-import { env, SELF } from 'cloudflare:test';
+import { createExecutionContext, env, SELF } from 'cloudflare:test';
+import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client-current';
+import worker from '../src/worker.ts';
 import schemaSql from '../migrations/d1/0001_memories.sql?raw';
 import mediaSql from '../migrations/d1/0002_media.sql?raw';
 
@@ -414,4 +416,129 @@ test('a stale consent denial gets the expired-authorization page and no redirect
   expect(response.status).toBe(400);
   expect(response.headers.get('location')).toBeNull();
   expect(await response.text()).toContain('This authorization has expired or is invalid.');
+});
+
+test('the consent page loads for localhost, [::1] and https callbacks, and escapes the client name it shows', async () => {
+  for (const redirectUri of ['http://localhost:4000/callback', 'http://[::1]:4100/callback', 'https://client.example/callback']) {
+    const registration = await SELF.fetch(`${origin}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Tom & <Jerry>',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        scope: 'memory:read offline_access',
+      }),
+    });
+    expect(registration.status).toBe(201);
+    const url = new URL(`${origin}/authorize`);
+    url.search = new URLSearchParams({
+      response_type: 'code', client_id: scope((await json(registration)).client_id), redirect_uri: redirectUri,
+      code_challenge: await s256(randomString(48)), code_challenge_method: 'S256', state: randomString(12),
+      scope: 'memory:read', resource,
+    }).toString();
+    const consent = await SELF.fetch(url);
+    expect(consent.status).toBe(200);
+    expect(consent.headers.get('content-security-policy')).toBe(`default-src 'none'; form-action 'self' ${new URL(redirectUri).origin}; base-uri 'none'; frame-ancestors 'none'`);
+    expect(await consent.text()).toContain('<strong>Tom &#38; &#60;Jerry&#62;</strong>');
+  }
+});
+
+test('approval without any owner passphrase is refused like a wrong one, and grants nothing', async () => {
+  const redirectUri = 'http://127.0.0.1:43210/oauth/callback';
+  const attempt = await beginAuthorization(await registerTestClient(redirectUri), redirectUri, ['memory:read', 'offline_access']);
+  const form = new URLSearchParams({ handle: attempt.handle, decision: 'approve' });
+  for (const value of attempt.scopes) form.append('scope', value);
+  const missing = await SELF.fetch(new Request(`${origin}/authorize`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: origin, Cookie: attempt.cookie },
+    body: form.toString(),
+  }));
+  expect(missing.status).toBe(401);
+  expect(missing.headers.get('location')).toBeNull();
+  expect(await missing.text()).toContain('The owner passphrase is incorrect');
+});
+
+test('an authorization handle is accepted up to 512 characters, and a longer or missing one is refused as expired', async () => {
+  const send = (handle: string | null) => {
+    const form = new URLSearchParams({ decision: 'approve', password: 'incorrect-test-password', scope: 'memory:read' });
+    if (handle !== null) form.set('handle', handle);
+    return SELF.fetch(new Request(`${origin}/authorize`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: origin },
+      body: form.toString(),
+    }));
+  };
+  const expired = 'This authorization has expired or is invalid. Start connecting again.';
+  // A handle that passes the length check reaches the passphrase check, which fails here.
+  const atLimit = await send('h'.repeat(512));
+  expect(atLimit.status).toBe(401);
+  expect(await atLimit.text()).toContain('The owner passphrase is incorrect');
+  const overLimit = await send('h'.repeat(513));
+  expect(overLimit.status).toBe(400);
+  expect(await overLimit.text()).toContain(expired);
+  const missing = await send(null);
+  expect(missing.status).toBe(400);
+  expect(await missing.text()).toContain(expired);
+});
+
+test('a resource URL with a path, query or fragment other than /mcp, or an issuer on another origin, stops the Worker', () => {
+  const request = new Request(`${origin}/mcp`);
+  const ctx = createExecutionContext();
+  const withConfig = (overrides: Record<string, string>) => ({ ...env, ...overrides }) as unknown as Parameters<typeof worker.fetch>[1];
+  const refused: Record<string, string>[] = [
+    { MCP_RESOURCE_URL: `${origin}/other` },
+    { MCP_RESOURCE_URL: `${origin}/mcp?debug=1` },
+    { MCP_RESOURCE_URL: `${origin}/mcp#section` },
+    { OAUTH_ISSUER: 'http://localhost:8788' },
+  ];
+  for (const overrides of refused) {
+    expect(() => worker.fetch(request, withConfig(overrides), ctx)).toThrow('Configure one canonical origin, issuer, and /mcp resource URL');
+  }
+});
+
+test('a consent form of exactly 16,384 bytes is read in full, and a larger one is refused as too large', async () => {
+  const prefix = 'handle=never-issued-handle&decision=deny&padding=';
+  const post = (body: string) => SELF.fetch(new Request(`${origin}/authorize`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: origin },
+    body,
+  }));
+  const atLimit = await post(prefix + 'a'.repeat(16_384 - prefix.length));
+  expect(atLimit.status).toBe(400);
+  expect(await atLimit.text()).toContain('This authorization has expired or is invalid.');
+  const overLimit = await post(prefix + 'a'.repeat(16_385 - prefix.length));
+  expect(overLimit.status).toBe(413);
+  expect(await overLimit.text()).toContain('Request too large.');
+});
+
+test('a grant issued to another user is refused at /mcp, even when its props name the owner', async () => {
+  const redirectUri = 'https://client.example/callback';
+  const clientId = await registerTestClient(redirectUri);
+  const verifier = randomString(48);
+  const url = new URL(`${origin}/authorize`);
+  url.search = new URLSearchParams({
+    response_type: 'code', client_id: clientId, redirect_uri: redirectUri,
+    code_challenge: await s256(verifier), code_challenge_method: 'S256', state: 'foreign-grant', scope: 'memory:read', resource,
+  }).toString();
+  // Loading the consent page is what gives this environment its OAuth helpers.
+  expect((await SELF.fetch(url)).status).toBe(200);
+  const helpers = (env as unknown as { OAUTH_PROVIDER: OAuthHelpers }).OAUTH_PROVIDER;
+  const authRequest = await helpers.parseAuthRequest(new Request(url));
+  const completed = await helpers.completeAuthorization({ request: authRequest, userId: 'mallory', metadata: {}, scope: authRequest.scope, props: { ownerId: 'owner' } });
+  const tokenResponse = await exchangeCode(clientId, redirectUri, new URL(completed.redirectTo).searchParams.get('code') ?? '', verifier);
+  expect(tokenResponse.status).toBe(200);
+  const accessToken = scope((await json(tokenResponse)).access_token);
+  const mcp = await SELF.fetch(`${origin}/mcp`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+  expect(mcp.status).toBe(401);
+  expect(await mcp.text()).toBe('Unauthorized');
 });

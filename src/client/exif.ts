@@ -61,6 +61,7 @@ function findCaptureFields(bytes: Uint8Array): CaptureFields | null {
   if (!startsLikeJpeg(bytes)) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const span = findTiffSpan(bytes, view);
+  // The 8-byte TIFF header is read with buffer bounds, not segment bounds, so a shorter block stops here.
   if (span === null || span.start + 8 > span.end) return null;
   const little = readByteOrder(bytes, view, span.start);
   if (little === null) return null;
@@ -68,9 +69,9 @@ function findCaptureFields(bytes: Uint8Array): CaptureFields | null {
   return entries === null ? null : { ...captureOffsets(entries), end: span.end };
 }
 
-// A JPEG starts with the SOI marker FF D8, and the four bytes of its first segment must be present.
+// A JPEG starts with the SOI marker FF D8. A shorter input has no segment after it, so the walk below finds nothing.
 function startsLikeJpeg(bytes: Uint8Array): boolean {
-  return bytes.byteLength >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8;
+  return bytes[0] === 0xff && bytes[1] === 0xd8;
 }
 
 // Walks the JPEG segments before the image data and returns the TIFF block of the first APP1 "Exif" segment.

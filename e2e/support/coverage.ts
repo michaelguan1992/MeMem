@@ -6,7 +6,7 @@ import libCoverage from 'istanbul-lib-coverage';
 import libReport from 'istanbul-lib-report';
 import reports from 'istanbul-reports';
 import { parseAstAsync } from 'vitest/node';
-import { ROOT } from './paths.ts';
+import { RUN_ROOT } from './paths.ts';
 
 /** One page's V8 coverage for /capture.js. `source` is the bundle the browser ran, with its inline source map. */
 export interface CaptureScriptCoverage {
@@ -34,8 +34,8 @@ async function convertCapture(capture: CaptureScriptCoverage) {
     code: capture.source,
     sourceMap,
     ast: await parseAstAsync(capture.source),
-    // The map's source paths are relative to the repository root. The URL is placed there so that they resolve.
-    coverage: { url: pathToFileURL(join(ROOT, 'capture.js')).href, functions: capture.functions },
+    // The map's source paths are relative to the tree the bundle was built from. The URL is placed there so that they resolve.
+    coverage: { url: pathToFileURL(join(RUN_ROOT, 'capture.js')).href, functions: capture.functions },
     wrapperLength: 0,
   });
 }
@@ -44,7 +44,7 @@ async function convertCapture(capture: CaptureScriptCoverage) {
 function e2eFileByRepoPath(data: Awaited<ReturnType<typeof convertCapture>>): Record<string, object> {
   const kept: Record<string, object> = {};
   for (const [file, coverage] of Object.entries(data)) {
-    const path = relative(ROOT, file);
+    const path = relative(RUN_ROOT, file);
     if (path !== E2E_FILE) continue;
     const withJson = coverage as { toJSON?: () => object };
     kept[path] = { ...(typeof withJson.toJSON === 'function' ? withJson.toJSON() : coverage), path };

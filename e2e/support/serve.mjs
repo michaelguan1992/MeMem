@@ -32,6 +32,13 @@ function stop(signal) {
 }
 process.on('SIGTERM', () => stop('SIGTERM'));
 process.on('SIGINT', () => stop('SIGINT'));
+// The Playwright run can be killed without stopping this process (a mutator timeout kills its process group, and this
+// server sits in a group of its own). Once its parent is gone this process is reparented, so it stops wrangler itself.
+const parent = process.ppid;
+const orphanCheck = setInterval(() => {
+  if (process.ppid !== parent) stop('SIGTERM');
+}, 250);
+orphanCheck.unref();
 
 wrangler.on('exit', async (code, signal) => {
   await rm(stateDirectory, { recursive: true, force: true });

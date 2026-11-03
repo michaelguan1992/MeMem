@@ -41,3 +41,23 @@ test('MCP tool inputs refuse an owner or any other unknown key', async () => {
     await close();
   } finally { db.close(); }
 });
+
+test('a rejected tool input names the field that failed', async () => {
+  const db = openSqliteStore(':memory:');
+  try {
+    const { client, close } = await connect(db.store);
+    const refused = await client.callTool({ name: 'record_memory', arguments: { kind: 'diary', text: 'x' } });
+    assert.equal(refused.isError, true);
+    assert.match(JSON.stringify(refused.content), /输入无效：kind Unknown memory kind/);
+    await close();
+  } finally { db.close(); }
+});
+
+test('the server tells clients that its tool list does not change', async () => {
+  const db = openSqliteStore(':memory:');
+  try {
+    const { client, close } = await connect(db.store);
+    assert.equal(client.getServerCapabilities()?.tools?.listChanged, false);
+    await close();
+  } finally { db.close(); }
+});

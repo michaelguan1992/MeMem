@@ -181,7 +181,7 @@ export const FIRST_VERSION: Version = parse(versionSchema, 1);
  */
 export function parse<S extends z.ZodType>(schema: S, value: unknown): z.output<S> {
   const result = schema.safeParse(value);
-  return result.success ? result.data : invalid(result.error.issues[0]?.message ?? 'Invalid input');
+  return result.success ? result.data : invalid(result.error.issues[0].message);
 }
 
 /**
@@ -190,6 +190,6 @@ export function parse<S extends z.ZodType>(schema: S, value: unknown): z.output<
  */
 export function parseStored<S extends z.ZodType>(schema: S, value: unknown, what: string): z.output<S> {
   const result = schema.safeParse(value);
-  if (!result.success) throw new Error(`Corrupt ${what} in storage: ${result.error.issues[0]?.message ?? 'invalid value'}`);
+  if (!result.success) throw new Error(`Corrupt ${what} in storage: ${result.error.issues[0].message}`);
   return result.data;
 }

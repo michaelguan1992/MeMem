@@ -461,3 +461,82 @@ test('request errors keep their messages for unknown fields, wrong values and fo
       .toEqual({ message, status: 400, body: { error: 'INVALID_INPUT', message } });
   }
 });
+
+test('cookies for other names before the session cookie are skipped, and the session still counts', async () => {
+  await reset();
+  const auth = await signIn();
+  const response = await SELF.fetch(request('GET', '/api/related', { cookie: `theme=dark; flag; ${auth.cookie}`, csrf: auth.csrf }));
+  expect(response.status).toBe(200);
+});
+
+test('a JSON endpoint refuses a request with no Content-Type with 415, and one with no body with a JSON error', async () => {
+  await reset();
+  const auth = await signIn();
+  const before = await snapshot();
+  const session = { Origin: origin, Cookie: auth.cookie, 'X-CSRF-Token': auth.csrf };
+  const untyped = await SELF.fetch(new Request(`${origin}/api/entries`, { method: 'POST', headers: session }));
+  expect(untyped.status).toBe(415);
+  expect(await json(untyped)).toEqual({ error: 'unsupported_media_type', message: 'Expected application/json' });
+  const empty = await SELF.fetch(new Request(`${origin}/api/entries`, { method: 'POST', headers: { ...session, 'Content-Type': 'application/json' } }));
+  expect(empty.status).toBe(400);
+  expect(await json(empty)).toEqual({ error: 'INVALID_INPUT', message: 'Request body must be valid JSON' });
+  expect(await snapshot()).toEqual(before);
+});
+
+test('an upload declared over 32 MiB is refused with 413 even when it sends no body', async () => {
+  await reset();
+  const auth = await signIn();
+  const response = await SELF.fetch(new Request(`${origin}/api/media`, {
+    method: 'POST',
+    headers: { Origin: origin, Cookie: auth.cookie, 'X-CSRF-Token': auth.csrf, 'Content-Type': 'multipart/form-data; boundary=memem', 'Content-Length': String(32 * MiB + 1) },
+  }));
+  expect(response.status).toBe(413);
+  expect(await json(response)).toMatchObject({ error: 'payload_too_large' });
+});
+
+test('an upload declared at exactly 32 MiB passes the size check, and its body is then read as a form', async () => {
+  await reset();
+  const auth = await signIn();
+  const response = await SELF.fetch(request('POST', '/api/media', auth, new Uint8Array(32 * MiB), { 'Content-Type': 'multipart/form-data; boundary=memem' }));
+  expect(response.status).toBe(400);
+  expect(await json(response)).toEqual({ error: 'INVALID_INPUT', message: 'Invalid multipart form data' });
+});
+
+test('a photo sent without preview files, or with empty preview inputs, is saved without previews', async () => {
+  await reset();
+  const auth = await signIn();
+  const bare = await uploadPhoto(auth, { original: file(jpeg('no-previews')) });
+  const emptyInputs = await upload(auth, { original: file(jpeg('empty-previews')), display: new File([], 'display.jpg', { type: 'image/jpeg' }), thumb: '' });
+  expect(emptyInputs.status).toBe(201);
+  const empty = (await json<{ media: MediaRecord }>(emptyInputs)).media;
+  for (const id of [bare.id, empty.id]) {
+    for (const variant of ['display', 'thumb']) {
+      expect((await SELF.fetch(request('GET', `/api/media/${id}/${variant}`, auth))).status).toBe(404);
+    }
+  }
+});
+
+test('a full page of 50 photos lists a cursor for the next page, and the page after it is empty', async () => {
+  await reset();
+  const auth = await signIn();
+  for (let i = 0; i < 50; i++) await uploadPhoto(auth, { original: file(jpeg(`page-${i}`)) });
+  const first = await json<MediaPage>(await SELF.fetch(request('GET', '/api/media', auth)));
+  expect(first.items).toHaveLength(50);
+  expect(first.nextAfterId).toBe(first.items[49].id);
+  const next = await json<MediaPage>(await SELF.fetch(request('GET', `/api/media?afterId=${first.nextAfterId}`, auth)));
+  expect(next).toEqual({ items: [], nextAfterId: null });
+});
+
+test('a declared Content-Length that is not a whole number is refused with 413, and nothing is stored', async () => {
+  await reset();
+  const auth = await signIn();
+  const before = await snapshot();
+  const response = await SELF.fetch(new Request(`${origin}/api/media`, {
+    method: 'POST',
+    headers: { Origin: origin, Cookie: auth.cookie, 'X-CSRF-Token': auth.csrf, 'Content-Type': 'multipart/form-data; boundary=memem', 'Content-Length': 'abc' },
+    body: '--memem--\r\n',
+  }));
+  expect(response.status).toBe(413);
+  expect(await json(response)).toMatchObject({ error: 'payload_too_large' });
+  expect(await snapshot()).toEqual(before);
+});

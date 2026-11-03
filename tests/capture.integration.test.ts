@@ -282,3 +282,11 @@ test('login refuses an oversized body with 413 and a non-form body with 400, and
   expect(notAForm.headers.get('set-cookie')).toBeNull();
   expect(await notAForm.text()).toContain('Invalid form.');
 });
+
+test('pages are served over HTTPS, and plain HTTP is served only to this machine', async () => {
+  expect((await SELF.fetch('https://memem.example/capture')).status).toBe(200);
+  expect((await SELF.fetch(`${origin}/capture`)).status).toBe(200);
+  const plain = await SELF.fetch('http://memem.example/capture');
+  expect(plain.status).toBe(403);
+  expect(await plain.text()).toBe('HTTPS is required');
+});

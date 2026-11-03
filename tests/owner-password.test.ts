@@ -42,3 +42,28 @@ test('a missing part, an unknown version or a wrong-length salt is rejected', as
   assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v2.${SALT_TEXT}.${DIGEST_TEXT}`), false);
   assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${DIGEST_TEXT}.${DIGEST_TEXT}`), false);
 });
+
+test('a digest that differs from the right one only in its first byte is refused', async () => {
+  const digest = createHash('sha256').update(Buffer.from(SALT_TEXT, 'base64url')).update(PASSPHRASE, 'utf8').digest();
+  digest[0] ^= 0x01;
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${SALT_TEXT}.${digest.toString('base64url')}`), false);
+});
+
+test('a digest that is not valid base64url is refused rather than thrown', async () => {
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${SALT_TEXT}.!!!!`), false);
+});
+
+test('a salt that is not 16 bytes is refused even when the digest over it matches', async () => {
+  const salt = Buffer.from('01234567');
+  const digest = createHash('sha256').update(salt).update(PASSPHRASE, 'utf8').digest('base64url');
+  assert.equal(await verifyOwnerPassword(PASSPHRASE, `sha256-v1.${salt.toString('base64url')}.${digest}`), false);
+});
+
+test('a passphrase of 512 characters verifies, and one of 513 characters is refused', async () => {
+  const salt = Buffer.from('0123456789abcdef');
+  const verifierFor = (passphrase: string) => `sha256-v1.${salt.toString('base64url')}.${createHash('sha256').update(salt).update(passphrase, 'utf8').digest('base64url')}`;
+  const longest = 'p'.repeat(512);
+  assert.equal(await verifyOwnerPassword(longest, verifierFor(longest)), true);
+  const tooLong = 'p'.repeat(513);
+  assert.equal(await verifyOwnerPassword(tooLong, verifierFor(tooLong)), false);
+});

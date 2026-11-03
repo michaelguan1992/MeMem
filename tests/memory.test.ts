@@ -86,6 +86,7 @@ for (const [name, factory] of [
       await assert.rejects(api.record({ kind: 'event', text: 'meal', occurredAt: '2026-10-09' }), { code: 'INVALID_INPUT' });
       await assert.rejects(api.search({ limit: 0 }), { code: 'INVALID_INPUT' });
       await assert.rejects(api.search({ from: '2026-10-10T00:00:00Z', before: '2026-10-09T00:00:00Z' }), { code: 'INVALID_INPUT' });
+      await assert.rejects(api.search({ from: '2026-10-09T03:00:00Z', before: '2026-10-09T03:00:00Z' }), { code: 'INVALID_INPUT', message: 'Invalid time range' });
       assert.equal((await api.search()).length, 0);
     } finally { db.close(); }
   });

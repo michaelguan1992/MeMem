@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { ROOT, runStateDir } from './paths.ts';
+import { REPO_ROOT, runStateDir } from './paths.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,7 +13,7 @@ export function sqlString(value: string): string {
 /** Runs one wrangler D1 command against this run's state directory. `--local` keeps it off Cloudflare. */
 async function wrangler(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('npx', ['wrangler', ...args, '--local', '--persist-to', runStateDir()], {
-    cwd: ROOT,
+    cwd: REPO_ROOT,
     env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
     maxBuffer: 64 * 1024 * 1024,
   });

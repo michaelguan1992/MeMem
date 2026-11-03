@@ -10,6 +10,7 @@ import { createD1MediaStore } from '../src/storage/media-d1.ts';
 import { createD1Store } from '../src/storage/d1.ts';
 import type { D1Binding } from '../src/storage/d1.ts';
 import { createMediaService } from '../src/core/media.ts';
+import { createR2BlobStore, type R2Binding } from '../src/platform/r2.ts';
 import type { MediaUpload, MediaVariant } from '../src/core/schema.ts';
 import { instantOf, mediaIdOf, memoryIdOf, sha256Of, versionOf } from './brands.ts';
 import { createMemoryService } from '../src/core/service.ts';
@@ -400,6 +401,46 @@ test('unlinkMemory leaves a photo alone when it moved to another memory mid-run'
   } finally { t.close(); }
 });
 
+test('unlinkMemory leaves alone a photo that was removed during the run', async () => {
+  const t = setup();
+  try {
+    await memory(t);
+    const { media: photo } = await service(t).upload(input(jpeg, { memoryId: 'trip' }));
+    const removedMidRun: MediaStore = {
+      ...t.media,
+      async save(owner, record, expectedVersion) {
+        if (expectedVersion !== null) {
+          await t.media.delete(owner, record.id, versionOf(expectedVersion)); // another request deletes the photo first
+          return false;
+        }
+        return t.media.save(owner, record, expectedVersion);
+      },
+    };
+    assert.equal(await service(t, 'alice', removedMidRun).unlinkMemory('trip'), 0);
+    assert.equal(await t.media.get('alice', photo.id), null);
+  } finally { t.close(); }
+});
+
+test('unlinkMemory stops after two lost compare-and-set attempts and leaves the photo linked', async () => {
+  const t = setup();
+  try {
+    await memory(t);
+    const { media: photo } = await service(t).upload(input(jpeg, { memoryId: 'trip' }));
+    let conditionalSaves = 0;
+    const twoConcurrentEdits: MediaStore = {
+      ...t.media,
+      async save(owner, record, expectedVersion) {
+        // The first two conditional saves lose to concurrent edits. A third would succeed, and must not be tried.
+        if (expectedVersion !== null && conditionalSaves++ < 2) return false;
+        return t.media.save(owner, record, expectedVersion);
+      },
+    };
+    assert.equal(await service(t, 'alice', twoConcurrentEdits).unlinkMemory('trip'), 0);
+    assert.equal(conditionalSaves, 2);
+    assert.equal((await t.media.get('alice', photo.id))?.memoryId, 'trip');
+  } finally { t.close(); }
+});
+
 test('media store filters, pages, compares versions and enforces unique hashes per owner', async () => {
   const t = setup();
   try {
@@ -475,4 +516,36 @@ test('a corrupt media row is refused on read instead of being returned as a phot
     await assert.rejects(media.get('alice', mediaIdOf('p0001')), corrupt);
     await assert.rejects(media.list('alice'), corrupt);
   } finally { db.close(); }
+});
+
+test('an empty caption is kept as written, which is not the same as no caption', async () => {
+  const t = setup();
+  try {
+    const api = service(t);
+    const { media: empty } = await api.upload(input(jpeg, { caption: '' }));
+    const { media: none } = await api.upload(input(png));
+    assert.equal((await t.media.get('alice', empty.id))?.caption, '');
+    assert.equal((await t.media.get('alice', none.id))?.caption, null);
+  } finally { t.close(); }
+});
+
+test('the R2 blob store returns a stored content type, and octet-stream when R2 has none', async () => {
+  const objects = new Map<string, { httpMetadata?: { contentType?: string } }>([
+    ['typed', { httpMetadata: { contentType: 'image/webp' } }],
+    ['bare', {}],
+    ['untyped', { httpMetadata: {} }],
+  ]);
+  const bucket: R2Binding = {
+    async put() { return undefined; },
+    async get(key) {
+      const object = objects.get(key);
+      return object ? { body: new ReadableStream<Uint8Array>(), ...object } : null;
+    },
+    async delete() {},
+  };
+  const store = createR2BlobStore(bucket);
+  assert.equal((await store.get('typed'))?.contentType, 'image/webp');
+  assert.equal((await store.get('bare'))?.contentType, 'application/octet-stream');
+  assert.equal((await store.get('untyped'))?.contentType, 'application/octet-stream');
+  assert.equal(await store.get('missing'), null);
 });

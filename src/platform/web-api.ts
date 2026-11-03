@@ -54,7 +54,7 @@ function errorResponse(error: unknown): Response {
   return fail(500, 'unavailable');
 }
 
-const mediaType = (request: Request): string | undefined => request.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+const mediaType = (request: Request): string | undefined => request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
 function parseJson(bytes: Uint8Array): unknown {
   try { return JSON.parse(new TextDecoder().decode(bytes)); }
   catch { throw bad('Request body must be valid JSON'); }
