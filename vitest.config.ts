@@ -19,7 +19,7 @@ export default defineConfig({
       {
         test: {
           name: 'core',
-          include: ['tests/memory.test.ts', 'tests/media.test.ts', 'tests/schema.test.ts', 'tests/mcp-tools.test.ts', 'tests/capture-client.test.ts'],
+          include: ['tests/memory.test.ts', 'tests/media.test.ts', 'tests/schema.test.ts', 'tests/mcp-tools.test.ts', 'tests/capture-client.test.ts', 'tests/capture-logic.test.ts'],
         },
       },
       {

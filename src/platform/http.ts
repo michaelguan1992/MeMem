@@ -30,6 +30,15 @@ export async function readBoundedForm(request: Request, maximumBytes: number): P
   if (type !== 'application/x-www-form-urlencoded') throw new Error('Expected URL-encoded form data');
   return new URLSearchParams(new TextDecoder().decode(await readBoundedBytes(request, maximumBytes)));
 }
+/** A form the handler refuses, with the message and status to send instead. */
+export interface FormRefusal { message: string; status: number }
+/** A bounded URL-encoded form, or the refusal to send: 413 when the body is over the limit, 400 for any other failure. */
+export async function readFormOrRefusal(request: Request, maximumBytes: number): Promise<URLSearchParams | FormRefusal> {
+  try { return await readBoundedForm(request, maximumBytes); }
+  catch (error) {
+    return error instanceof PayloadTooLargeError ? { message: 'Request too large.', status: 413 } : { message: 'Invalid form.', status: 400 };
+  }
+}
 export function sameOriginPost(request: Request): boolean {
   const origin = request.headers.get('Origin');
   return Boolean(origin && origin === new URL(request.url).origin);

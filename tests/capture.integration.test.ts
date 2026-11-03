@@ -264,3 +264,21 @@ test('capture static files reject every method except GET', async () => {
     expect(response.headers.get('allow')).toBe('GET');
   }
 });
+
+test('login refuses an oversized body with 413 and a non-form body with 400, and issues no cookie', async () => {
+  await migrate();
+  const oversized = await SELF.fetch(postForm('/capture/login', { password: 'x'.repeat(5000) }));
+  expect(oversized.status).toBe(413);
+  expect(oversized.headers.get('set-cookie')).toBeNull();
+  expect(await oversized.text()).toContain('Request too large.');
+
+  const notAForm = await SELF.fetch(new Request(`${origin}/capture/login`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ password: ownerPassphrase }),
+  }));
+  expect(notAForm.status).toBe(400);
+  expect(notAForm.headers.get('set-cookie')).toBeNull();
+  expect(await notAForm.text()).toContain('Invalid form.');
+});

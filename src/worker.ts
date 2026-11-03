@@ -1,9 +1,9 @@
 import { createMcpHandler } from 'agents/mcp/server';
 import type { AuthInfo } from '@modelcontextprotocol/server';
-import { AuthorizationError, CimdFetchError, OAuthProvider, type OAuthHelpers, type OAuthResourceContext } from '@cloudflare/workers-oauth-provider';
+import { AuthorizationError, CimdFetchError, OAuthProvider, type OAuthHelpers, type OAuthProviderOptions, type OAuthResourceAuth, type OAuthResourceContext } from '@cloudflare/workers-oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 import { createCloudflareMemory } from './platform/cloudflare.ts';
-import { htmlEscape, PayloadTooLargeError, readBoundedForm, sameOriginPost } from './platform/http.ts';
+import { htmlEscape, readFormOrRefusal, sameOriginPost } from './platform/http.ts';
 import { verifyOwnerPassword } from './platform/owner-password.ts';
 import type { R2Binding } from './platform/r2.ts';
 import { handleCapture } from './platform/web-capture.ts';
@@ -13,6 +13,7 @@ import type { D1Binding } from './storage/d1.ts';
 
 const OWNER_ID = 'owner';
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
 
 interface WorkerEnv {
   DB: D1Binding;
@@ -58,9 +59,12 @@ function consentPage(details: Awaited<ReturnType<OAuthHelpers['describeConsent']
     : '';
   return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Connect MeMem</title><h1>Connect MeMem</h1><p><strong>${htmlEscape(details.clientName)}</strong> is requesting access to your personal memories.</p><p>Authorization will be sent to: <strong>${htmlEscape(details.redirectHost)}</strong></p>${details.clientDomain ? `<p>Client website: <strong>${htmlEscape(details.clientDomain)}</strong></p>` : '<p>The client name is self-reported and its publisher has not been verified.</p>'}${redirectNotice}<p>Choose the permissions to allow:</p><form method="post" action="/authorize"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopes}<p><label>Owner passphrase: <input type="password" name="password" autocomplete="current-password" required></label></p>${errorMessage ? `<p role="alert">${htmlEscape(errorMessage)}</p>` : ''}<p><button name="decision" value="approve">Allow and connect</button> <button name="decision" value="deny" formnovalidate>Deny</button></p></form></html>`;
 }
+/** HTTPS, or plain HTTP to this machine for local development. */
+function isSecureUrl(url: URL): boolean {
+  return url.protocol === 'https:' || (url.protocol === 'http:' && LOOPBACK_HOSTS.includes(url.hostname));
+}
 function isSecureRequest(request: Request, _env: WorkerEnv): boolean {
-  const url = new URL(request.url);
-  return url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname));
+  return isSecureUrl(new URL(request.url));
 }
 function authErrorResponse(error: unknown): Response {
   if (error instanceof AuthorizationError && error.redirectTo) return Response.redirect(error.redirectTo, 302);
@@ -69,142 +73,214 @@ function authErrorResponse(error: unknown): Response {
   }
   return page('The authorization service is temporarily unavailable. Please try again later.', 503);
 }
-const defaultHandler = {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    if (!isSecureRequest(request, env)) return page('Production authorization requires HTTPS.', 403);
-    const capture = await handleCapture(request, env, OWNER_ID);
-    if (capture) return capture;
-    const api = await handleApi(request, env, OWNER_ID);
-    if (api) return api;
-    if (new URL(request.url).pathname !== '/authorize') return new Response('Not found', { status: 404 });
-    if (request.method === 'GET') {
-      try {
-        const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-        const details = await env.OAUTH_PROVIDER.describeConsent(authRequest);
-        const consent = await env.OAUTH_PROVIDER.beginConsent(authRequest);
-        consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-        consent.headers.set('Cache-Control', 'no-store');
-        consent.headers.set('Referrer-Policy', 'same-origin');
-        consent.headers.set('X-Content-Type-Options', 'nosniff');
-        consent.headers.set('X-Frame-Options', 'DENY');
-        // Chrome checks form-action through the approval POST's 302. Permit only the origin
-        // from OAuthProvider's already-validated redirect URI, retaining a narrow source list.
-        consent.headers.set('Content-Security-Policy', `default-src 'none'; form-action 'self' ${consentCallbackOrigin(authRequest.redirectUri)}; base-uri 'none'; frame-ancestors 'none'`);
-        return new Response(consentPage(details, consent.handle), { headers: consent.headers });
-      } catch (error) {
-        return authErrorResponse(error);
-      }
-    }
-    if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, POST' } });
-    if (!sameOriginPost(request)) return page('Request origin check failed. Return to your MCP client and start connecting again.', 403);
-    let form: URLSearchParams;
-    try { form = await readBoundedForm(request, 16_384); }
-    catch (error) {
-      return error instanceof PayloadTooLargeError ? page('Request too large.', 413) : page('Invalid form.', 400);
-    }
-    const handle = form.get('handle');
-    if (typeof handle !== 'string' || !handle || handle.length > 512) return page('This authorization has expired or is invalid. Start connecting again.', 400);
-    if (form.get('decision') === 'deny') {
-      try {
-        const denied = await env.OAUTH_PROVIDER.denyConsent(request, handle);
-        return new Response(null, { status: 302, headers: denied.headers });
-      } catch (error) {
-        return error instanceof AuthorizationError ? page('This authorization has expired or is invalid. Start connecting again.', 400) : page('The authorization service is temporarily unavailable. Please try again later.', 503);
-      }
-    }
-    if (form.get('decision') !== 'approve') return page('Invalid authorization choice.', 400);
-    const requestedScopes = form.getAll('scope').filter((scope): scope is string => typeof scope === 'string');
-    if (!requestedScopes.includes(MEMORY_READ_SCOPE)) return page('Connecting MeMem requires at least the read memories permission.', 400);
-    const password = form.get('password');
-    if (!env.OWNER_PASSWORD_HASH || !password || !await verifyOwnerPassword(password, env.OWNER_PASSWORD_HASH)) {
-      return page('The owner passphrase is incorrect, or this authorization page has expired. Go back and start connecting again.', 401);
-    }
+/** Everything that is not OAuthProvider's own route: the capture pages, the owner's JSON API, and the consent page. */
+async function serveWeb(request: Request, env: WorkerEnv): Promise<Response> {
+  if (!isSecureRequest(request, env)) return page('Production authorization requires HTTPS.', 403);
+  const surface = await serveSurface(request, env);
+  if (surface) return surface;
+  if (new URL(request.url).pathname !== '/authorize') return new Response('Not found', { status: 404 });
+  return authorize(request, env);
+}
+const defaultHandler = { fetch: serveWeb };
 
-    try {
-      const approved = await env.OAUTH_PROVIDER.approveConsent(request, handle, { scope: requestedScopes });
-      const authorization = await env.OAUTH_PROVIDER.completeAuthorization({
-        request: approved.request,
-        userId: OWNER_ID,
-        metadata: {},
-        scope: approved.request.scope,
-        props: { ownerId: OWNER_ID },
-      });
-      approved.headers.set('Location', authorization.redirectTo);
-      return new Response(null, { status: 302, headers: approved.headers });
-    } catch (error) {
-      return error instanceof AuthorizationError || error instanceof CimdFetchError
-        ? page('This authorization has expired or the selected permissions are invalid. Start connecting again.', 400)
-        : page('The authorization service is temporarily unavailable. Please try again later.', 503);
-    }
-  },
-};
+/** The capture pages and the JSON API. Null for any other path. */
+async function serveSurface(request: Request, env: WorkerEnv): Promise<Response | null> {
+  const capture = await handleCapture(request, env, OWNER_ID);
+  if (capture) return capture;
+  return handleApi(request, env, OWNER_ID);
+}
 
-function makeApiHandler() {
+/** /authorize: the consent page for GET, and the approve or deny decision for POST. */
+async function authorize(request: Request, env: WorkerEnv): Promise<Response> {
+  if (request.method === 'GET') return showConsent(request, env);
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+  return submitConsent(request, env);
+}
+
+async function showConsent(request: Request, env: WorkerEnv): Promise<Response> {
+  try {
+    const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+    const details = await env.OAUTH_PROVIDER.describeConsent(authRequest);
+    const consent = await env.OAUTH_PROVIDER.beginConsent(authRequest);
+    consent.headers.set('Content-Type', 'text/html; charset=utf-8');
+    consent.headers.set('Cache-Control', 'no-store');
+    consent.headers.set('Referrer-Policy', 'same-origin');
+    consent.headers.set('X-Content-Type-Options', 'nosniff');
+    consent.headers.set('X-Frame-Options', 'DENY');
+    // Chrome checks form-action through the approval POST's 302. Permit only the origin
+    // from OAuthProvider's already-validated redirect URI, retaining a narrow source list.
+    consent.headers.set('Content-Security-Policy', `default-src 'none'; form-action 'self' ${consentCallbackOrigin(authRequest.redirectUri)}; base-uri 'none'; frame-ancestors 'none'`);
+    return new Response(consentPage(details, consent.handle), { headers: consent.headers });
+  } catch (error) {
+    return authErrorResponse(error);
+  }
+}
+
+/** A consent form that passed the origin check and carries a well-formed one-time handle. */
+interface Submission { form: URLSearchParams; handle: string }
+
+async function submitConsent(request: Request, env: WorkerEnv): Promise<Response> {
+  const submission = await readSubmission(request);
+  if (submission instanceof Response) return submission;
+  const { form, handle } = submission;
+  if (form.get('decision') === 'deny') return denyAuthorization(request, env, handle);
+  if (form.get('decision') !== 'approve') return page('Invalid authorization choice.', 400);
+  return approveAuthorization(request, env, form, handle);
+}
+
+/** Checks the origin, reads the form, and checks the handle. Returns the page to send instead when any of these fails. */
+async function readSubmission(request: Request): Promise<Submission | Response> {
+  if (!sameOriginPost(request)) return page('Request origin check failed. Return to your MCP client and start connecting again.', 403);
+  const form = await readFormOrRefusal(request, 16_384);
+  if (!(form instanceof URLSearchParams)) return page(form.message, form.status);
+  const handle = validHandle(form);
+  if (!handle) return page('This authorization has expired or is invalid. Start connecting again.', 400);
+  return { form, handle };
+}
+
+/** A handle is a non-empty string of at most 512 characters. Anything else is no handle. */
+function validHandle(form: URLSearchParams): string | undefined {
+  const handle = form.get('handle');
+  return typeof handle === 'string' && handle && handle.length <= 512 ? handle : undefined;
+}
+
+async function denyAuthorization(request: Request, env: WorkerEnv, handle: string): Promise<Response> {
+  try {
+    const denied = await env.OAUTH_PROVIDER.denyConsent(request, handle);
+    return new Response(null, { status: 302, headers: denied.headers });
+  } catch (error) {
+    return error instanceof AuthorizationError
+      ? page('This authorization has expired or is invalid. Start connecting again.', 400)
+      : page('The authorization service is temporarily unavailable. Please try again later.', 503);
+  }
+}
+
+/** Approval needs the read permission and the owner passphrase, both checked before anything is granted. */
+async function approveAuthorization(request: Request, env: WorkerEnv, form: URLSearchParams, handle: string): Promise<Response> {
+  const requestedScopes = form.getAll('scope').filter((scope): scope is string => typeof scope === 'string');
+  if (!requestedScopes.includes(MEMORY_READ_SCOPE)) return page('Connecting MeMem requires at least the read memories permission.', 400);
+  const password = form.get('password');
+  if (!env.OWNER_PASSWORD_HASH || !password || !await verifyOwnerPassword(password, env.OWNER_PASSWORD_HASH)) {
+    return page('The owner passphrase is incorrect, or this authorization page has expired. Go back and start connecting again.', 401);
+  }
+  return completeApproval(request, env, handle, requestedScopes);
+}
+
+async function completeApproval(request: Request, env: WorkerEnv, handle: string, scope: string[]): Promise<Response> {
+  try {
+    const approved = await env.OAUTH_PROVIDER.approveConsent(request, handle, { scope });
+    const authorization = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: approved.request,
+      userId: OWNER_ID,
+      metadata: {},
+      scope: approved.request.scope,
+      props: { ownerId: OWNER_ID },
+    });
+    approved.headers.set('Location', authorization.redirectTo);
+    return new Response(null, { status: 302, headers: approved.headers });
+  } catch (error) {
+    return error instanceof AuthorizationError || error instanceof CimdFetchError
+      ? page('This authorization has expired or the selected permissions are invalid. Start connecting again.', 400)
+      : page('The authorization service is temporarily unavailable. Please try again later.', 503);
+  }
+}
+
+/** OAuthProvider attaches `auth` to the execution context only after it has validated the bearer token. */
+function resourceContext(executionContext: ExecutionContext): OAuthResourceContext<unknown> | undefined {
+  // Its runtime context adds auth/props even though its ExportedHandler declaration omits that type.
+  const ctx = executionContext as (OAuthResourceContext<unknown> | undefined);
+  return ctx && typeof ctx === 'object' && ctx.auth ? ctx : undefined;
+}
+
+/** The owner recorded in a token's props. Anything other than an object carrying `ownerId` is no owner. */
+function ownerOf(props: unknown): unknown {
+  return typeof props === 'object' && props !== null && 'ownerId' in props ? (props as { ownerId?: unknown }).ownerId : undefined;
+}
+
+/** A token belongs to this owner only if it was issued to the owner, to a client, for this resource. */
+function isOwnersToken(verified: OAuthResourceAuth, props: unknown, expectedResource: string): verified is OAuthResourceAuth & { clientId: string } {
+  return ownerOf(props) === OWNER_ID && verified.userId === OWNER_ID && Boolean(verified.clientId) && verified.audience === expectedResource;
+}
+
+function authInfoOf(verified: OAuthResourceAuth & { clientId: string }, props: unknown): AuthInfo {
   return {
-    async fetch(request: Request, env: WorkerEnv, executionContext: ExecutionContext): Promise<Response> {
-      // OAuthProvider invokes apiHandler only after validating the bearer token; its runtime
-      // context adds auth/props even though its ExportedHandler declaration omits that type.
-      const ctx = executionContext as (OAuthResourceContext<unknown> | undefined);
-      if (!ctx || typeof ctx !== 'object' || !ctx.auth) {
-        return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"' } });
-      }
-      const expectedResource = new URL(env.MCP_RESOURCE_URL).href;
-      const verified = ctx.auth;
-      const ownerIdFromProps = typeof ctx.props === 'object' && ctx.props !== null && 'ownerId' in ctx.props
-        ? (ctx.props as { ownerId?: unknown }).ownerId
-        : undefined;
-      if (ownerIdFromProps !== OWNER_ID || verified.userId !== OWNER_ID || !verified.clientId || verified.audience !== expectedResource) {
-        return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"' } });
-      }
-      if (!verified.scope.includes(MEMORY_READ_SCOPE)) {
-        return new Response('Insufficient scope', {
-          status: 403,
-          headers: { 'WWW-Authenticate': `Bearer error="insufficient_scope", scope="${MEMORY_READ_SCOPE}"` },
-        });
-      }
-      const authInfo: AuthInfo = {
-        token: verified.token,
-        clientId: verified.clientId,
-        scopes: [...verified.scope],
-        ...(verified.expiresAt === undefined ? {} : { expiresAt: verified.expiresAt }),
-        resource: new URL(verified.audience),
-        extra: { props: ctx.props as Record<string, unknown> },
-      };
-      const handler = createMcpHandler(({ authInfo: requestAuth }) => {
-        if (!requestAuth || requestAuth.clientId !== authInfo.clientId || requestAuth.resource?.href !== expectedResource) {
-          throw new Error('Missing verified MCP auth context');
-        }
-        const props = requestAuth.extra?.props;
-        const ownerId = typeof props === 'object' && props !== null && 'ownerId' in props
-          ? (props as { ownerId?: unknown }).ownerId
-          : undefined;
-        if (ownerId !== OWNER_ID) throw new Error('Missing verified owner context');
-        const service = createCloudflareMemory(env, OWNER_ID);
-        return createMemoryMcpServer(service, {
-          scopes: requestAuth.scopes,
-          resourceUrl: requestAuth.resource ?? new URL(env.MCP_RESOURCE_URL),
-        });
-      }, { route: '/mcp', corsOptions: false });
-      return handler.fetch(request, { authInfo });
-    },
+    token: verified.token,
+    clientId: verified.clientId,
+    scopes: [...verified.scope],
+    ...(verified.expiresAt === undefined ? {} : { expiresAt: verified.expiresAt }),
+    resource: new URL(verified.audience),
+    extra: { props: props as Record<string, unknown> },
   };
+}
+
+function unauthorizedResponse(): Response {
+  return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"' } });
+}
+
+function insufficientScopeResponse(): Response {
+  return new Response('Insufficient scope', {
+    status: 403,
+    headers: { 'WWW-Authenticate': `Bearer error="insufficient_scope", scope="${MEMORY_READ_SCOPE}"` },
+  });
+}
+
+/** The MCP server for one request. Its owner comes only from the verified props, and its memory service is built for that owner. */
+function mcpServerFor(env: WorkerEnv, requestAuth: AuthInfo) {
+  if (ownerOf(requestAuth.extra?.props) !== OWNER_ID) throw new Error('Missing verified owner context');
+  const service = createCloudflareMemory(env, OWNER_ID);
+  return createMemoryMcpServer(service, {
+    scopes: requestAuth.scopes,
+    resourceUrl: requestAuth.resource ?? new URL(env.MCP_RESOURCE_URL),
+  });
+}
+
+/** The transport passes back the auth it was given. Anything other than this request's verified auth is refused. */
+function assertSameAuth(requestAuth: AuthInfo | undefined, authInfo: AuthInfo, expectedResource: string): asserts requestAuth is AuthInfo {
+  if (!requestAuth || requestAuth.clientId !== authInfo.clientId || requestAuth.resource?.href !== expectedResource) {
+    throw new Error('Missing verified MCP auth context');
+  }
+}
+
+function mcpHandlerFor(env: WorkerEnv, authInfo: AuthInfo, expectedResource: string) {
+  return createMcpHandler(({ authInfo: requestAuth }) => {
+    assertSameAuth(requestAuth, authInfo, expectedResource);
+    return mcpServerFor(env, requestAuth);
+  }, { route: '/mcp', corsOptions: false });
+}
+
+/** The protected MCP resource. OAuthProvider calls it only after the bearer token has been validated. */
+async function serveMcp(request: Request, env: WorkerEnv, executionContext: ExecutionContext): Promise<Response> {
+  const ctx = resourceContext(executionContext);
+  if (!ctx) return unauthorizedResponse();
+  const expectedResource = new URL(env.MCP_RESOURCE_URL).href;
+  const verified = ctx.auth;
+  if (!isOwnersToken(verified, ctx.props, expectedResource)) return unauthorizedResponse();
+  if (!verified.scope.includes(MEMORY_READ_SCOPE)) return insufficientScopeResponse();
+  const authInfo = authInfoOf(verified, ctx.props);
+  return mcpHandlerFor(env, authInfo, expectedResource).fetch(request, { authInfo });
 }
 
 function createProvider(env: WorkerEnv): OAuthProvider<WorkerEnv> {
   const resourceUrl = new URL(env.MCP_RESOURCE_URL);
   const issuerUrl = new URL(env.OAUTH_ISSUER);
-  if (resourceUrl.protocol !== 'https:' && !(resourceUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(resourceUrl.hostname))) {
-    throw new Error('MCP_RESOURCE_URL must be HTTPS (loopback HTTP is allowed only for local development)');
-  }
-  if (issuerUrl.protocol !== 'https:' && !(issuerUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(issuerUrl.hostname))) {
-    throw new Error('OAUTH_ISSUER must be HTTPS (loopback HTTP is allowed only for local development)');
-  }
+  if (!isSecureUrl(resourceUrl)) throw new Error('MCP_RESOURCE_URL must be HTTPS (loopback HTTP is allowed only for local development)');
+  if (!isSecureUrl(issuerUrl)) throw new Error('OAUTH_ISSUER must be HTTPS (loopback HTTP is allowed only for local development)');
+  assertCanonical(resourceUrl, issuerUrl);
+  return new OAuthProvider<WorkerEnv>(providerOptions(resourceUrl, issuerUrl));
+}
+
+/** One origin serves both the issuer and the /mcp resource, and the resource carries no query or fragment. */
+function assertCanonical(resourceUrl: URL, issuerUrl: URL): void {
   if (resourceUrl.pathname !== '/mcp' || resourceUrl.search || resourceUrl.hash || issuerUrl.origin !== resourceUrl.origin) {
     throw new Error('Configure one canonical origin, issuer, and /mcp resource URL');
   }
-  return new OAuthProvider<WorkerEnv>({
+}
+
+/** The OAuthProvider configuration: endpoints, token lifetimes, scopes, and the protected-resource metadata this deployment advertises. */
+function providerOptions(resourceUrl: URL, issuerUrl: URL): OAuthProviderOptions<WorkerEnv> {
+  return {
     apiRoute: '/mcp',
-    apiHandler: makeApiHandler(),
+    apiHandler: { fetch: serveMcp },
     defaultHandler,
     authorizeEndpoint: '/authorize',
     tokenEndpoint: '/oauth/token',
@@ -220,7 +296,7 @@ function createProvider(env: WorkerEnv): OAuthProvider<WorkerEnv> {
       resource_name: 'MeMem personal memory service',
       bearer_methods_supported: ['header'],
     },
-  });
+  };
 }
 
 export default {

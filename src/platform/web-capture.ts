@@ -1,6 +1,6 @@
 import type { D1Binding } from '../storage/d1.ts';
 import { captureScript } from '../generated/capture-script.ts';
-import { htmlEscape, PayloadTooLargeError, readBoundedForm, sameOriginPost } from './http.ts';
+import { htmlEscape, readFormOrRefusal, sameOriginPost } from './http.ts';
 import { verifyOwnerPassword } from './owner-password.ts';
 import { checkCsrf, clearSessionCookie, createSession, destroySession, readSession, SESSION_MAX_AGE_SECONDS, sessionCookie, type WebSession } from './web-session.ts';
 
@@ -21,7 +21,6 @@ function htmlHeaders(contentSecurityPolicy: string): Record<string, string> {
 const loginHeaders = htmlHeaders(loginCsp);
 const captureHeaders = htmlHeaders(captureCsp);
 const staticHeaders = { 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' };
-const capturePaths = new Set(['/capture', '/capture/login', '/capture/logout', '/capture.js', '/capture.webmanifest', '/capture-icon.svg']);
 
 // Public static files: they hold no data and do not need a session.
 const manifest = JSON.stringify({
@@ -144,8 +143,7 @@ function redirectToCapture(setCookie: string): Response {
 function methodNotAllowed(allow: string): Response {
   return new Response('Method not allowed', { status: 405, headers: { Allow: allow } });
 }
-function staticFile(request: Request, body: string, contentType: string, extra: Record<string, string> = {}): Response {
-  if (request.method !== 'GET') return methodNotAllowed('GET');
+function staticResponse(body: string, contentType: string, extra: Record<string, string> = {}): Response {
   return new Response(body, { headers: { 'Content-Type': contentType, ...staticHeaders, ...extra } });
 }
 async function currentSession(db: D1Binding, request: Request, owner: string, now: Date): Promise<WebSession | null> {
@@ -153,43 +151,53 @@ async function currentSession(db: D1Binding, request: Request, owner: string, no
   return session?.owner === owner ? session : null;
 }
 
-export async function handleCapture(request: Request, env: { DB: D1Binding; OWNER_PASSWORD_HASH: string }, owner: string): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
-  if (!capturePaths.has(pathname)) return null;
-  if (pathname === '/capture.js') return staticFile(request, captureScript, 'text/javascript; charset=utf-8');
-  if (pathname === '/capture.webmanifest') return staticFile(request, manifest, 'application/manifest+json');
-  if (pathname === '/capture-icon.svg') return staticFile(request, iconSvg, 'image/svg+xml', { 'Content-Security-Policy': "default-src 'none'" });
-  const now = new Date();
-  if (pathname === '/capture') {
-    if (request.method !== 'GET') return methodNotAllowed('GET');
-    const session = await currentSession(env.DB, request, owner, now);
-    return session ? htmlResponse(capturePage(session.csrf), 200, captureHeaders) : htmlResponse(loginPage());
+/** What every capture route receives. `now` is taken once per request. */
+interface CaptureEnv { DB: D1Binding; OWNER_PASSWORD_HASH: string }
+interface CaptureCall { request: Request; env: CaptureEnv; owner: string; now: Date }
+/** A route names the one method it serves. Any other method gets 405 with that method as its Allow value. */
+interface CaptureRoute { method: 'GET' | 'POST'; handle: (call: CaptureCall) => Promise<Response> | Response }
+
+async function showCapture({ request, env, owner, now }: CaptureCall): Promise<Response> {
+  const session = await currentSession(env.DB, request, owner, now);
+  return session ? htmlResponse(capturePage(session.csrf), 200, captureHeaders) : htmlResponse(loginPage());
+}
+
+async function postLogin({ request, env, owner, now }: CaptureCall): Promise<Response> {
+  if (!sameOriginPost(request)) return messagePage('Request origin check failed. Reload the page and try again.', 403);
+  const form = await readFormOrRefusal(request, 4096);
+  if (!(form instanceof URLSearchParams)) return htmlResponse(loginPage(form.message), form.status);
+  const password = form.get('password');
+  if (!password || !await verifyOwnerPassword(password, env.OWNER_PASSWORD_HASH)) {
+    return htmlResponse(loginPage('The owner passphrase is incorrect. Try again.'), 401);
   }
-  if (pathname === '/capture/login') {
-    if (request.method !== 'POST') return methodNotAllowed('POST');
-    if (!sameOriginPost(request)) return messagePage('Request origin check failed. Reload the page and try again.', 403);
-    let form: URLSearchParams;
-    try { form = await readBoundedForm(request, 4096); }
-    catch (error) {
-      return error instanceof PayloadTooLargeError ? htmlResponse(loginPage('Request too large.'), 413) : htmlResponse(loginPage('Invalid form.'), 400);
-    }
-    const password = form.get('password');
-    if (!password || !await verifyOwnerPassword(password, env.OWNER_PASSWORD_HASH)) {
-      return htmlResponse(loginPage('The owner passphrase is incorrect. Try again.'), 401);
-    }
-    const { token } = await createSession(env.DB, owner, now);
-    return redirectToCapture(sessionCookie(token, SESSION_MAX_AGE_SECONDS));
-  }
-  if (request.method !== 'POST') return methodNotAllowed('POST');
+  const { token } = await createSession(env.DB, owner, now);
+  return redirectToCapture(sessionCookie(token, SESSION_MAX_AGE_SECONDS));
+}
+
+async function postLogout({ request, env, owner, now }: CaptureCall): Promise<Response> {
   if (!sameOriginPost(request)) return messagePage('Request origin check failed. Reload the page and try again.', 403);
   const session = await currentSession(env.DB, request, owner, now);
   if (!session) return redirectToCapture(clearSessionCookie());
-  let form: URLSearchParams;
-  try { form = await readBoundedForm(request, 4096); }
-  catch (error) {
-    return error instanceof PayloadTooLargeError ? messagePage('Request too large.', 413) : messagePage('Invalid form.', 400);
-  }
+  const form = await readFormOrRefusal(request, 4096);
+  if (!(form instanceof URLSearchParams)) return messagePage(form.message, form.status);
   if (!await checkCsrf(session, form.get('csrf'))) return messagePage('This logout request is invalid. Reload the page and try again.', 403);
   await destroySession(env.DB, session.tokenHash);
   return redirectToCapture(clearSessionCookie());
+}
+
+// Exact paths. A matched path checks its method first (405), then the handler runs its own origin, session and CSRF checks.
+const captureRoutes = new Map<string, CaptureRoute>([
+  ['/capture', { method: 'GET', handle: showCapture }],
+  ['/capture/login', { method: 'POST', handle: postLogin }],
+  ['/capture/logout', { method: 'POST', handle: postLogout }],
+  ['/capture.js', { method: 'GET', handle: () => staticResponse(captureScript, 'text/javascript; charset=utf-8') }],
+  ['/capture.webmanifest', { method: 'GET', handle: () => staticResponse(manifest, 'application/manifest+json') }],
+  ['/capture-icon.svg', { method: 'GET', handle: () => staticResponse(iconSvg, 'image/svg+xml', { 'Content-Security-Policy': "default-src 'none'" }) }],
+]);
+
+export async function handleCapture(request: Request, env: CaptureEnv, owner: string): Promise<Response | null> {
+  const route = captureRoutes.get(new URL(request.url).pathname);
+  if (!route) return null;
+  if (request.method !== route.method) return methodNotAllowed(route.method);
+  return route.handle({ request, env, owner, now: new Date() });
 }

@@ -403,3 +403,15 @@ test('OAuth discovery, DCR, PKCE, refresh and Streamable HTTP MCP CRUD run again
     await client.close();
   }
 });
+
+test('a stale consent denial gets the expired-authorization page and no redirect', async () => {
+  const response = await SELF.fetch(new Request(`${origin}/authorize`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: origin },
+    body: new URLSearchParams({ handle: 'never-issued-handle', decision: 'deny' }).toString(),
+  }));
+  expect(response.status).toBe(400);
+  expect(response.headers.get('location')).toBeNull();
+  expect(await response.text()).toContain('This authorization has expired or is invalid.');
+});

@@ -10,7 +10,7 @@ import type { D1Binding } from '../storage/d1.ts';
 import { createCloudflareMedia, createCloudflareMemory } from './cloudflare.ts';
 import { PayloadTooLargeError, readBoundedBytes, sameOriginPost } from './http.ts';
 import type { R2Binding } from './r2.ts';
-import { checkCsrf, readSession } from './web-session.ts';
+import { checkCsrf, readSession, type WebSession } from './web-session.ts';
 
 type ApiEnv = { DB: D1Binding; MEDIA: R2Binding };
 type MemoryService = ReturnType<typeof createCloudflareMemory>;
@@ -176,35 +176,64 @@ async function readMedia(media: MediaService, id: string, variant: MediaVariant)
   } });
 }
 
+/** What a route handler receives: the request, its parsed URL, and the owner's services. */
+interface ApiCall {
+  request: Request;
+  url: URL;
+  memories: MemoryService;
+  media: MediaService;
+}
+/** A handler receives the groups its route pattern captured, in order. */
+type Handler = (call: ApiCall, params: string[]) => Promise<Response>;
+interface Route { pattern: RegExp; methods: ReadonlyMap<string, Handler> }
+const defineRoute = (pattern: RegExp, handlers: Record<string, Handler>): Route => ({ pattern, methods: new Map(Object.entries(handlers)) });
+
+// Matched in this order. A path that matches without the request's method gets 405, and Allow lists its methods in the order written here.
+const routes: readonly Route[] = [
+  defineRoute(/^\/api\/entries$/, { POST: ({ request, memories }) => createEntry(request, memories) }),
+  defineRoute(/^\/api\/related$/, { GET: ({ url, memories }) => relatedPeople(url, memories) }),
+  defineRoute(/^\/api\/media$/, {
+    GET: ({ url, media }) => listMedia(url, media),
+    POST: ({ request, media }) => uploadMedia(request, media),
+  }),
+  defineRoute(/^\/api\/media\/([^/]+)$/, {
+    // The ID is parsed before the body is read, so a malformed ID is reported ahead of a malformed body.
+    PATCH: ({ request, media }, [id]) => updateMedia(request, media, parse(mediaIdSchema, id)),
+    DELETE: ({ request, media }, [id]) => deleteMedia(request, media, parse(mediaIdSchema, id)),
+  }),
+  defineRoute(variantPath, {
+    GET: ({ media }, [id, variant]) => readMedia(media, parse(mediaIdSchema, id), parse(mediaVariantSchema, variant)),
+  }),
+];
+
+/** The first route whose pattern matches the path, with the groups it captured. */
+function findRoute(pathname: string): { route: Route; params: string[] } | undefined {
+  for (const candidate of routes) {
+    const match = candidate.pattern.exec(pathname);
+    if (match) return { route: candidate, params: match.slice(1) };
+  }
+  return undefined;
+}
+
+async function handleRoute(call: ApiCall): Promise<Response> {
+  const found = findRoute(call.url.pathname);
+  if (!found) return fail(404, 'not_found', 'Not found');
+  const handler = found.route.methods.get(call.request.method);
+  if (!handler) return notAllowed([...found.route.methods.keys()].join(', '));
+  return handler(call, found.params);
+}
+
+/** A write must come from this origin and carry the CSRF token issued with the session. */
+async function trustedWrite(request: Request, session: WebSession): Promise<boolean> {
+  return sameOriginPost(request) && await checkCsrf(session, request.headers.get('X-CSRF-Token'));
+}
+
 async function dispatch(request: Request, env: ApiEnv, owner: string): Promise<Response> {
   const url = new URL(request.url);
   const session = await readSession(env.DB, request, new Date());
   if (!session || session.owner !== owner) return fail(401, 'unauthorized');
-  if (request.method !== 'GET' && (!sameOriginPost(request) || !await checkCsrf(session, request.headers.get('X-CSRF-Token')))) {
-    return fail(403, 'forbidden', 'Request origin or CSRF token check failed');
-  }
-  const memories = createCloudflareMemory(env, owner);
-  const media = createCloudflareMedia(env, owner);
-  const { pathname } = url;
-  const { method } = request;
-  if (pathname === '/api/entries') return method === 'POST' ? createEntry(request, memories) : notAllowed('POST');
-  if (pathname === '/api/related') return method === 'GET' ? relatedPeople(url, memories) : notAllowed('GET');
-  if (pathname === '/api/media') {
-    if (method === 'GET') return listMedia(url, media);
-    return method === 'POST' ? uploadMedia(request, media) : notAllowed('GET, POST');
-  }
-  const item = /^\/api\/media\/([^/]+)$/.exec(pathname);
-  if (item) {
-    if (method === 'PATCH') return updateMedia(request, media, parse(mediaIdSchema, item[1]));
-    return method === 'DELETE' ? deleteMedia(request, media, parse(mediaIdSchema, item[1])) : notAllowed('PATCH, DELETE');
-  }
-  const variant = variantPath.exec(pathname);
-  if (variant) {
-    return method === 'GET'
-      ? readMedia(media, parse(mediaIdSchema, variant[1]), parse(mediaVariantSchema, variant[2]))
-      : notAllowed('GET');
-  }
-  return fail(404, 'not_found', 'Not found');
+  if (request.method !== 'GET' && !await trustedWrite(request, session)) return fail(403, 'forbidden', 'Request origin or CSRF token check failed');
+  return handleRoute({ request, url, memories: createCloudflareMemory(env, owner), media: createCloudflareMedia(env, owner) });
 }
 
 /** JSON and multipart API for the owner's own session. Returns null outside /api/. */
