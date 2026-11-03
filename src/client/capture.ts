@@ -8,6 +8,8 @@ import {
   controlsFor,
   currentWall,
   derivativesOf,
+  dictationErrorMessage,
+  dictationLanguageFor,
   displayNameOf,
   doneOf,
   draftFor,
@@ -17,7 +19,9 @@ import {
   fitEdges,
   groupRelated,
   hexOf,
+  insertTranscript,
   isMissingWords,
+  joinTranscripts,
   linkBody,
   loadAllRelated,
   mediaPath,
@@ -30,6 +34,7 @@ import {
   photoOutcome,
   prefillFrom,
   requestPlan,
+  splitResults,
   statusClassOf,
   takenAtOf,
   thumbPath,
@@ -38,6 +43,7 @@ import type {
   Clock,
   CreatedEntry,
   Derivatives,
+  DictationLanguage,
   Draft,
   EntryBody,
   MediaEnvelope,
@@ -48,6 +54,7 @@ import type {
   RelatedPage,
   RequestPlan,
   Size,
+  SpeechResultLike,
   UploadResult,
 } from './capture-logic.ts';
 
@@ -59,6 +66,8 @@ import type {
  */
 
 const JPEG_QUALITY = 0.85;
+// The dictation language's localStorage key. Storage can be blocked, so every access to it is guarded.
+const DICTATE_LANGUAGE_KEY = 'memem-dictate-lang';
 
 interface QueueItem {
   file: File;
@@ -70,6 +79,28 @@ interface QueueItem {
   status: HTMLSpanElement;
 }
 
+/** The parts of the browser's speech recognition that the page uses. The page reads the results it is given, and nothing else. */
+interface SpeechRecognitionLike {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: { resultIndex: number; results: ArrayLike<SpeechResultLike> }) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+}
+type SpeechConstructor = new () => SpeechRecognitionLike;
+
+/**
+ * The language select, typed by the members the page uses. HTMLSelectElement cannot be the target of a cast from an
+ * element in this TypeScript's DOM library, so it is not used.
+ */
+interface LanguageSelect extends HTMLElement {
+  value: string;
+  disabled: boolean;
+}
+
 interface CaptureState {
   busy: boolean;
   memoryId: string | null;
@@ -78,6 +109,8 @@ interface CaptureState {
   exifOffset: string | null;
   queue: QueueItem[];
   prefillRun: number;
+  /** The dictation that is running, or null when the page is not listening. */
+  recognition: SpeechRecognitionLike | null;
 }
 
 interface CaptureElements {
@@ -91,6 +124,10 @@ interface CaptureElements {
   saveButton: HTMLButtonElement;
   statusLine: HTMLParagraphElement;
   savedPhotos: HTMLDivElement;
+  dictateBox: HTMLDivElement;
+  dictateButton: HTMLButtonElement;
+  dictateLang: LanguageSelect;
+  dictateStatus: HTMLParagraphElement;
 }
 
 /** Everything one page instance reads or writes: its element references, the CSRF token and its state. */
@@ -118,12 +155,13 @@ function startCapturePage(): void {
   const page: CapturePage = {
     els: findElements(form),
     csrf: csrfTokenOf(csrfMeta),
-    state: { busy: false, memoryId: null, draft: null, exifOffset: null, queue: [], prefillRun: 0 },
+    state: { busy: false, memoryId: null, draft: null, exifOffset: null, queue: [], prefillRun: 0, recognition: null },
   };
   page.els.photosInput.addEventListener('change', () => { onPhotosChanged(page); });
   page.els.form.addEventListener('submit', (event) => { onSubmit(page, event); });
   page.els.whenInput.value = currentWall(browserClock);
   applyLocks(page);
+  setupDictation(page);
   loadRelated(page)
     .then((items) => { renderRelated(page, items); })
     .catch((error: unknown) => { page.els.relatedList.textContent = TEXT.relatedFailed + messageOf(error); });
@@ -145,12 +183,21 @@ function findElements(form: HTMLFormElement): CaptureElements {
     saveButton: document.getElementById('save-button') as HTMLButtonElement,
     statusLine: document.getElementById('status') as HTMLParagraphElement,
     savedPhotos: document.getElementById('saved-photos') as HTMLDivElement,
+    dictateBox: document.getElementById('dictate') as HTMLDivElement,
+    dictateButton: document.getElementById('dictate-button') as HTMLButtonElement,
+    dictateLang: document.getElementById('dictate-lang') as LanguageSelect,
+    dictateStatus: document.getElementById('dictate-status') as HTMLParagraphElement,
   };
 }
 
 function showStatus(page: CapturePage, message: string, isError: boolean): void {
-  page.els.statusLine.textContent = message;
-  page.els.statusLine.className = statusClassOf(isError);
+  writeStatus(page.els.statusLine, message, isError);
+}
+
+/** Writes a status line's text, styled as an error when `isError` is set. */
+function writeStatus(line: HTMLElement, message: string, isError: boolean): void {
+  line.textContent = message;
+  line.className = statusClassOf(isError);
 }
 
 function setItem(item: QueueItem, phase: Phase, text: string): void {
@@ -224,6 +271,8 @@ function applyLocks(page: CapturePage): void {
   els.photosInput.disabled = locks.entryLocked;
   els.saveButton.disabled = locks.saveDisabled;
   els.saveButton.textContent = locks.saveLabel;
+  els.dictateButton.disabled = locks.entryLocked;
+  els.dictateLang.disabled = locks.entryLocked;
 }
 
 function setBusy(page: CapturePage, flag: boolean): void {
@@ -420,6 +469,7 @@ function reportPending(page: CapturePage): void {
 
 async function save(page: CapturePage, text: string): Promise<void> {
   setBusy(page, true);
+  stopDictation(page); // no speech may land in the entry once it is being saved
   page.els.savedPhotos.textContent = '';
   showStatus(page, TEXT.saving, false);
   try {
@@ -443,6 +493,111 @@ function onSubmit(page: CapturePage, event: Event): void {
   const text = page.els.textInput.value.trim();
   if (refuseMissingWords(page, text)) return;
   save(page, text);
+}
+
+// Dictation writes the browser's final speech into the entry at the caret. The controls appear only where the browser has
+// speech recognition, and a running dictation stops when a save starts.
+
+/** The standard speech recognition constructor, or the WebKit one, or null when the browser has neither. */
+function speechConstructor(): SpeechConstructor | null {
+  const speechWindow = window as unknown as { SpeechRecognition?: SpeechConstructor; webkitSpeechRecognition?: SpeechConstructor };
+  return (speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition) ?? null;
+}
+
+/** Shows and wires the dictation controls when the browser can dictate. The language select starts from the stored choice. */
+function setupDictation(page: CapturePage): void {
+  const speech = speechConstructor();
+  if (speech === null) return;
+  const { els } = page;
+  els.dictateBox.hidden = false;
+  els.dictateLang.value = dictationLanguageFor(readStoredLanguage(), navigator.language);
+  els.dictateButton.addEventListener('click', () => { onDictateClicked(page, speech); });
+  els.dictateLang.addEventListener('change', () => { onLanguageChanged(page); });
+}
+
+function readStoredLanguage(): string | null {
+  try {
+    return localStorage.getItem(DICTATE_LANGUAGE_KEY);
+  } catch {
+    return null; // storage is blocked, so the browser's language gives the default
+  }
+}
+
+function rememberLanguage(language: string): void {
+  try {
+    localStorage.setItem(DICTATE_LANGUAGE_KEY, language);
+  } catch {
+    // storage is blocked, so the choice applies to this page only
+  }
+}
+
+function onLanguageChanged(page: CapturePage): void {
+  rememberLanguage(page.els.dictateLang.value);
+  // A running recognition keeps the language it started with, so it is stopped and the next Dictate uses the new one.
+  stopDictation(page);
+}
+
+function onDictateClicked(page: CapturePage, speech: SpeechConstructor): void {
+  if (page.state.recognition !== null) stopDictation(page);
+  else startDictation(page, speech);
+}
+
+function startDictation(page: CapturePage, speech: SpeechConstructor): void {
+  const lang = page.els.dictateLang.value as DictationLanguage;
+  const recognition = new speech();
+  recognition.lang = lang;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.onresult = (event) => { onDictationResult(page, lang, event); };
+  recognition.onerror = (event) => { onDictationError(page, event.error); };
+  recognition.onend = () => { onDictationEnd(page); };
+  page.state.recognition = recognition;
+  setDictateButton(page, true);
+  writeStatus(page.els.dictateStatus, TEXT.dictateListening, false);
+  recognition.start();
+}
+
+function stopDictation(page: CapturePage): void {
+  if (page.state.recognition !== null) page.state.recognition.stop();
+}
+
+/** Final text goes into the entry unless the entry is locked. The status line shows the interim text, or Listening. */
+function onDictationResult(page: CapturePage, lang: DictationLanguage, event: { resultIndex: number; results: ArrayLike<SpeechResultLike> }): void {
+  const heard = splitResults(event.results, event.resultIndex);
+  if (!isLocked(page)) insertDictated(page, lang, heard.finals);
+  writeStatus(page.els.dictateStatus, heard.interim === '' ? TEXT.dictateListening : heard.interim, false);
+}
+
+function isLocked(page: CapturePage): boolean {
+  return controlsFor(page.state.busy, page.state.memoryId).entryLocked;
+}
+
+/** The transcript goes in at the caret, replacing any selection. The input event tells the page that the entry changed. */
+function insertDictated(page: CapturePage, lang: DictationLanguage, finals: string[]): void {
+  const { textInput } = page.els;
+  const next = insertTranscript(textInput.value, textInput.selectionStart, textInput.selectionEnd, joinTranscripts(finals, lang), lang);
+  if (next.text === textInput.value) return;
+  textInput.value = next.text;
+  textInput.setSelectionRange(next.caret, next.caret);
+  textInput.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function onDictationError(page: CapturePage, code: string): void {
+  const message = dictationErrorMessage(code);
+  if (message !== null) writeStatus(page.els.dictateStatus, message, true);
+}
+
+/** The end event follows every stop, error and silence. An error message stays on the line; anything else is cleared. */
+function onDictationEnd(page: CapturePage): void {
+  page.state.recognition = null;
+  setDictateButton(page, false);
+  if (!page.els.dictateStatus.classList.contains('error')) writeStatus(page.els.dictateStatus, '', false);
+}
+
+function setDictateButton(page: CapturePage, listening: boolean): void {
+  const { dictateButton } = page.els;
+  dictateButton.textContent = listening ? TEXT.dictateStop : TEXT.dictate;
+  dictateButton.setAttribute('aria-pressed', String(listening));
 }
 
 startCapturePage();

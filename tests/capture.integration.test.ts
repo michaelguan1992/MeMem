@@ -204,10 +204,19 @@ test('the signed-in capture page is the real form, with its script, manifest and
     'id="save-button"',
     'id="status"',
     'action="/capture/logout"',
+    // The dictation controls start hidden; the script shows them only where the browser has speech recognition.
+    '<div id="dictate" class="dictate" hidden>',
+    '<button id="dictate-button" type="button" aria-pressed="false">Dictate</button>',
+    '<select id="dictate-lang">',
+    '<option value="zh-CN">中文</option>',
+    '<option value="en-US">English</option>',
+    '<p id="dictate-status" aria-live="polite"></p>',
+    "<p class=\"hint\">Speech is turned into text by your browser's speech service.</p>",
   ]) expect(html).toContain(expected);
   expect(html).not.toContain('Capture tools will appear here');
   expect(html).not.toContain(' onclick=');
   expect(html).not.toContain(' onsubmit=');
+  expect(html).not.toContain(' style=');
   expect(html).not.toContain('<script>');
 });
 

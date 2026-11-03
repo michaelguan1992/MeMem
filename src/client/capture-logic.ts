@@ -3,7 +3,8 @@ import { readJpegTakenAt } from './exif.ts';
 
 /**
  * The part of the /capture page that needs no DOM: wall-clock and offset text, JPEG and hex helpers, error text, request
- * plans, the entry and photo request bodies, derivative sizes, related-list paging and grouping, and status decisions.
+ * plans, the entry and photo request bodies, derivative sizes, related-list paging and grouping, status decisions, and
+ * the dictation language, transcript insertion and recognition-error text.
  * capture.ts runs the page with these functions. The clock and randomness come in as parameters (a Clock and a newId
  * function), so each function returns the same result for the same inputs. The only runtime import is the EXIF reader.
  */
@@ -46,6 +47,14 @@ export const TEXT = {
   untitledPhoto: 'Photo',
   noPeopleOrPlaces: 'No people or places saved yet.',
   relatedFailed: 'Could not load people and places. ',
+  dictate: 'Dictate',
+  dictateStop: 'Stop',
+  dictateListening: 'Listening…',
+  dictateDenied: 'Microphone access was denied.',
+  dictateNoSpeech: 'No speech was heard.',
+  dictateNoMic: 'No microphone was found.',
+  dictateNetwork: 'The speech service is unreachable.',
+  dictateStopped: 'Dictation stopped: ',
 } as const;
 
 /** The state a photo's row shows. */
@@ -444,4 +453,88 @@ export async function prefillFrom(files: Blob[], clock: Clock, use: (found: Pref
     return;
   }
   use({ wall: null, offset: null });
+}
+
+/** The two languages the dictation button recognises. The page's language select offers the same two. */
+export const DICTATION_LANGUAGES = ['zh-CN', 'en-US'] as const;
+export type DictationLanguage = (typeof DICTATION_LANGUAGES)[number];
+
+/** The language for a browser with no stored choice: Chinese for a zh browser language, English otherwise. */
+export function defaultDictationLanguage(browserLanguage: string): DictationLanguage {
+  return browserLanguage.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US';
+}
+
+/** The stored choice when it is one of the two languages, otherwise null. Any other stored text is ignored. */
+export function storedDictationLanguage(stored: string | null): DictationLanguage | null {
+  return DICTATION_LANGUAGES.find((language) => language === stored) ?? null;
+}
+
+/** The language a page starts with: a valid stored choice, or else the default for the browser's language. */
+export function dictationLanguageFor(stored: string | null, browserLanguage: string): DictationLanguage {
+  return storedDictationLanguage(stored) ?? defaultDictationLanguage(browserLanguage);
+}
+
+/** The text of the entry after a dictated transcript replaces text[start:end], and the caret position after it. */
+export interface InsertResult {
+  text: string;
+  caret: number;
+}
+
+/** A space separates the transcript from a neighbouring character only in English, and only when that character is not a space. */
+function joinSpace(neighbour: string, lang: DictationLanguage): string {
+  return lang === 'en-US' && /\S/.test(neighbour) ? ' ' : '';
+}
+
+/**
+ * Puts a dictated transcript in place of text[start:end]. The transcript is trimmed, and a blank one changes nothing.
+ * In English a single space separates it from a non-space character on either side. Chinese text gets no spaces.
+ * The caret goes after the inserted text, including a space that was added after it.
+ */
+export function insertTranscript(text: string, start: number, end: number, transcript: string, lang: DictationLanguage): InsertResult {
+  const spoken = transcript.trim();
+  if (spoken === '') return { text, caret: end };
+  const before = text.slice(0, start);
+  const after = text.slice(end);
+  const inserted = joinSpace(before.slice(-1), lang) + spoken + joinSpace(after.charAt(0), lang);
+  return { text: before + inserted + after, caret: before.length + inserted.length };
+}
+
+/** One result as the browser reports it: whether it is final, and its best transcript. */
+export interface SpeechResultLike {
+  readonly isFinal: boolean;
+  readonly 0: { readonly transcript: string };
+}
+
+/**
+ * The final transcripts from resultIndex on, in order, and the interim text that is still changing. Only the final
+ * transcripts go into the entry. The interim text is shown on the status line and nowhere else.
+ */
+export function splitResults(results: ArrayLike<SpeechResultLike>, resultIndex: number): { finals: string[]; interim: string } {
+  const finals: string[] = [];
+  let interim = '';
+  for (let index = resultIndex; index < results.length; index++) {
+    const result = results[index];
+    if (result.isFinal) finals.push(result[0].transcript);
+    else interim += result[0].transcript;
+  }
+  return { finals, interim };
+}
+
+/** The final transcripts of one result event as one piece of text: each trimmed, joined by a space in English and by nothing in Chinese. */
+export function joinTranscripts(parts: string[], lang: DictationLanguage): string {
+  return parts.map((part) => part.trim()).filter((part) => part !== '').join(lang === 'en-US' ? ' ' : '');
+}
+
+const DICTATION_ERROR_TEXT = new Map<string, string>([
+  ['not-allowed', TEXT.dictateDenied],
+  ['service-not-allowed', TEXT.dictateDenied],
+  ['no-speech', TEXT.dictateNoSpeech],
+  ['audio-capture', TEXT.dictateNoMic],
+  ['network', TEXT.dictateNetwork],
+]);
+
+/** The status text for a recognition error code. An aborted recognition was stopped on purpose, so it shows nothing (null). */
+export function dictationErrorMessage(code: string): string | null {
+  if (code === 'aborted') return null;
+  return DICTATION_ERROR_TEXT.get(code) ?? TEXT.dictateStopped + code;
 }

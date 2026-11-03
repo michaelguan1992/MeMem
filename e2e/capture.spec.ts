@@ -36,6 +36,70 @@ async function expectStatus(page: Page, text: string, error: boolean): Promise<v
   else await expect(status).not.toHaveClass(/error/);
 }
 
+/**
+ * Replaces the browser's speech recognition with a fake before the page's scripts run, and removes the WebKit one. Each
+ * instance the page creates is kept on window.__fakeSpeech, so a test can read what the page set and fire the handlers.
+ */
+async function fakeSpeechRecognition(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const instances: unknown[] = [];
+    class FakeRecognition {
+      lang = '';
+      continuous = false;
+      interimResults = false;
+      started = 0;
+      stopped = 0;
+      constructor() { instances.push(this); }
+      start(): void { this.started += 1; }
+      stop(): void { this.stopped += 1; }
+    }
+    Object.defineProperty(window, 'SpeechRecognition', { value: FakeRecognition, configurable: true, writable: true });
+    delete (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+    Object.defineProperty(window, '__fakeSpeech', { value: instances });
+  });
+}
+
+interface RecognitionView {
+  count: number;
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  started: number;
+  stopped: number;
+}
+
+/** The recognition the page created last: the settings it set, and how often the page started and stopped it. */
+async function latestRecognition(page: Page): Promise<RecognitionView> {
+  return page.evaluate((): RecognitionView => {
+    const all = (window as unknown as { __fakeSpeech: Array<Record<string, unknown>> }).__fakeSpeech;
+    const latest = all[all.length - 1] ?? {};
+    return {
+      count: all.length,
+      lang: String(latest.lang ?? ''),
+      continuous: latest.continuous === true,
+      interimResults: latest.interimResults === true,
+      started: Number(latest.started ?? 0),
+      stopped: Number(latest.stopped ?? 0),
+    };
+  });
+}
+
+/** Calls one of the page's handlers on the recognition the page created last, as the browser would. */
+async function fireHandler(page: Page, handler: 'onresult' | 'onerror' | 'onend', argument?: unknown): Promise<void> {
+  await page.evaluate(([name, value]) => {
+    const all = (window as unknown as { __fakeSpeech: Array<Record<string, ((value?: unknown) => void) | undefined>> }).__fakeSpeech;
+    all[all.length - 1][name]?.(value);
+  }, [handler, argument] as const);
+}
+
+/** The browser reports these results: each is final or interim, and only final text goes into the entry. */
+async function hear(page: Page, results: Array<{ isFinal: boolean; transcript: string }>): Promise<void> {
+  await fireHandler(page, 'onresult', {
+    resultIndex: 0,
+    results: results.map((result) => ({ isFinal: result.isFinal, 0: { transcript: result.transcript } })),
+  });
+}
+
 test('a wrong passphrase is refused, and the right one opens the capture form', async ({ page }) => {
   await page.goto('/capture');
   await page.getByLabel('Owner passphrase').fill('not the owner passphrase');
@@ -149,6 +213,7 @@ test.describe('a phone-sized screen', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
   test('the form fits the width with no horizontal scroll, and a note saves', async ({ page }) => {
+    await fakeSpeechRecognition(page);
     await signIn(page);
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow).toBe(0);
@@ -157,6 +222,8 @@ test.describe('a phone-sized screen', () => {
       page.getByLabel('What happened?', { exact: true }),
       page.getByLabel('When', { exact: true }),
       page.getByLabel('Photos', { exact: true }),
+      page.getByRole('button', { name: 'Dictate', exact: true }),
+      page.getByLabel('Language', { exact: true }),
       page.getByRole('button', { name: SAVE_BUTTON }),
     ]) {
       const box = await control.boundingBox();
@@ -238,4 +305,100 @@ test('while a save is in progress the form is locked and says so', async ({ page
   await expect(page.getByRole('button', { name: 'Saving…' })).toBeDisabled();
   release();
   await expectStatus(page, 'Saved.', false);
+});
+
+test('dictation puts final text at the caret, shows interim text only in the status, and the saved entry has it', async ({ page }) => {
+  const base = uniqueText('我们去了公园');
+  const expected = base.replace('我们去了公园', '我们中午去了公园');
+  await fakeSpeechRecognition(page);
+  await signIn(page);
+  const dictate = page.getByRole('button', { name: 'Dictate', exact: true });
+  await expect(page.locator('#dictate')).toBeVisible();
+  await expect(dictate).toHaveAttribute('aria-pressed', 'false');
+
+  await page.getByLabel('Language', { exact: true }).selectOption('zh-CN');
+  const entry = page.getByLabel('What happened?', { exact: true });
+  await entry.fill(base);
+  await entry.evaluate((element: HTMLTextAreaElement) => { element.setSelectionRange(2, 2); });
+  await dictate.click();
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#dictate-status')).toHaveText('Listening…');
+  expect(await latestRecognition(page)).toMatchObject({ count: 1, lang: 'zh-CN', continuous: true, interimResults: true, started: 1 });
+
+  await hear(page, [{ isFinal: false, transcript: '中' }]);
+  await expect(page.locator('#dictate-status')).toHaveText('中');
+  await expect(entry).toHaveValue(base);
+
+  await hear(page, [{ isFinal: true, transcript: '中午' }]);
+  await expect(entry).toHaveValue(expected);
+  await expect(entry).toHaveJSProperty('selectionStart', 4);
+  await expect(page.locator('#dictate-status')).toHaveText('Listening…');
+
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  expect((await latestRecognition(page)).stopped).toBe(1);
+  await fireHandler(page, 'onend');
+  await expect(dictate).toHaveText('Dictate');
+  await expect(dictate).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#dictate-status')).toHaveText('');
+
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expectStatus(page, 'Saved.', false);
+  await expect(dictate).toBeEnabled();
+  expect(await rowsWithText(expected)).toHaveLength(1);
+});
+
+test('a browser without speech recognition keeps the dictation controls hidden', async ({ page }) => {
+  await page.addInitScript(() => {
+    delete (window as unknown as { SpeechRecognition?: unknown }).SpeechRecognition;
+    delete (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+  });
+  await signIn(page);
+  await expect(page.getByLabel('What happened?', { exact: true })).toBeVisible();
+  await expect(page.locator('#dictate')).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Dictate', exact: true })).toBeHidden();
+});
+
+test('a denied microphone is named in the dictation status, and the button resets', async ({ page }) => {
+  await fakeSpeechRecognition(page);
+  await signIn(page);
+  const dictate = page.getByRole('button', { name: 'Dictate', exact: true });
+  await dictate.click();
+  await fireHandler(page, 'onerror', { error: 'not-allowed' });
+  await fireHandler(page, 'onend');
+  await expect(page.locator('#dictate-status')).toHaveText('Microphone access was denied.');
+  await expect(page.locator('#dictate-status')).toHaveClass('error');
+  await expect(dictate).toHaveText('Dictate');
+  await expect(dictate).toHaveAttribute('aria-pressed', 'false');
+});
+
+test('saving stops a running dictation, and the Dictate button and language stay locked until the save ends', async ({ page }) => {
+  await fakeSpeechRecognition(page);
+  await signIn(page);
+  const dictate = page.getByRole('button', { name: 'Dictate', exact: true });
+  const language = page.getByLabel('Language', { exact: true });
+  await dictate.click();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = () => { resolve(); }; });
+  await page.route('**/api/entries', async (route) => {
+    await held;
+    await route.continue();
+  });
+  await page.getByLabel('What happened?', { exact: true }).fill(uniqueText('Spoken while saving'));
+  await page.getByRole('button', { name: SAVE_BUTTON }).click();
+  await expect.poll(async () => (await latestRecognition(page)).stopped).toBe(1);
+  await fireHandler(page, 'onend');
+  await expect(dictate).toBeDisabled();
+  await expect(language).toBeDisabled();
+  release();
+  await expectStatus(page, 'Saved.', false);
+  await expect(dictate).toBeEnabled();
+  await expect(language).toBeEnabled();
+});
+
+test('the dictation language is remembered across reloads', async ({ page }) => {
+  await fakeSpeechRecognition(page);
+  await signIn(page);
+  await page.getByLabel('Language', { exact: true }).selectOption('zh-CN');
+  await page.reload();
+  await expect(page.getByLabel('Language', { exact: true })).toHaveValue('zh-CN');
 });

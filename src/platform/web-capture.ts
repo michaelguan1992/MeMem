@@ -66,9 +66,17 @@ legend { padding: 0 4px; font-weight: 600; }
 .photo[data-state="failed"] .status { color: var(--danger); }
 button { min-height: 48px; padding: 0 18px; font: inherit; font-weight: 600; border: 0; border-radius: 12px; cursor: pointer; }
 #save-button { width: 100%; background: var(--accent); color: var(--accent-ink); }
-button:disabled, textarea:disabled, input:disabled { opacity: 0.55; cursor: default; }
+button:disabled, textarea:disabled, input:disabled, select:disabled { opacity: 0.55; cursor: default; }
 #status { min-height: 1.5em; margin: 16px 0 0; }
-#status.error { color: var(--danger); }
+#status.error, #dictate-status.error { color: var(--danger); }
+.dictate { display: grid; gap: 8px; }
+.dictate[hidden] { display: none; }
+.dictate-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+#dictate-button { min-height: 48px; padding: 0 18px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); }
+#dictate-button[aria-pressed="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+#dictate-lang { min-height: 48px; padding: 0 12px; font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+#dictate-status { min-height: 1.5em; margin: 0; font-size: 0.9rem; color: var(--muted); overflow-wrap: anywhere; }
+.hint { margin: 0; font-size: 0.85rem; color: var(--muted); }
 .saved { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 0; }
 .saved figure { width: 96px; margin: 0; }
 .saved img { display: block; width: 96px; height: 96px; object-fit: cover; border-radius: 12px; background: var(--line); }
@@ -102,6 +110,18 @@ function capturePage(csrf: string): string {
 <div class="field">
 <label for="entry-text">What happened?</label>
 <textarea id="entry-text" name="text" rows="6"></textarea>
+<div id="dictate" class="dictate" hidden>
+<div class="dictate-controls">
+<button id="dictate-button" type="button" aria-pressed="false">Dictate</button>
+<label for="dictate-lang">Language</label>
+<select id="dictate-lang">
+<option value="zh-CN">中文</option>
+<option value="en-US">English</option>
+</select>
+</div>
+<p id="dictate-status" aria-live="polite"></p>
+<p class="hint">Speech is turned into text by your browser's speech service.</p>
+</div>
 </div>
 <div class="field">
 <label for="entry-when">When</label>

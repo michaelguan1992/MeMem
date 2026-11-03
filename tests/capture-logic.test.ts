@@ -7,7 +7,10 @@ import {
   checkOriginalSize,
   controlsFor,
   currentWall,
+  defaultDictationLanguage,
   derivativesOf,
+  dictationErrorMessage,
+  dictationLanguageFor,
   displayNameOf,
   doneOf,
   draftFor,
@@ -18,8 +21,10 @@ import {
   fitEdges,
   groupRelated,
   hexOf,
+  insertTranscript,
   isMissingWords,
   isWallTime,
+  joinTranscripts,
   keepIfWithin,
   linkBody,
   loadAllRelated,
@@ -38,7 +43,9 @@ import {
   prefillFromPhoto,
   relatedPagePath,
   requestPlan,
+  splitResults,
   statusClassOf,
+  storedDictationLanguage,
   takenAtOf,
   thumbPath,
   wallTimeOf,
@@ -506,4 +513,80 @@ test('displayNameOf falls back to Photo for an unnamed file', () => {
 test('statusClassOf marks only errors', () => {
   assert.equal(statusClassOf(true), 'error');
   assert.equal(statusClassOf(false), '');
+});
+
+test('defaultDictationLanguage picks Chinese for a Chinese browser language, and English otherwise', () => {
+  assert.equal(defaultDictationLanguage('zh-CN'), 'zh-CN');
+  assert.equal(defaultDictationLanguage('zh'), 'zh-CN');
+  assert.equal(defaultDictationLanguage('ZH-TW'), 'zh-CN');
+  assert.equal(defaultDictationLanguage('en-US'), 'en-US');
+  assert.equal(defaultDictationLanguage('fr-FR'), 'en-US');
+  assert.equal(defaultDictationLanguage(''), 'en-US');
+});
+
+test('storedDictationLanguage keeps only the two offered languages, and dictationLanguageFor prefers a valid stored choice', () => {
+  assert.equal(storedDictationLanguage('zh-CN'), 'zh-CN');
+  assert.equal(storedDictationLanguage('en-US'), 'en-US');
+  for (const stored of ['zh-TW', 'en', '', 'constructor', null]) assert.equal(storedDictationLanguage(stored), null);
+  assert.equal(dictationLanguageFor('en-US', 'zh-CN'), 'en-US');
+  assert.equal(dictationLanguageFor('zh-CN', 'en-US'), 'zh-CN');
+  assert.equal(dictationLanguageFor('fr-FR', 'zh-CN'), 'zh-CN');
+  assert.equal(dictationLanguageFor(null, 'en-US'), 'en-US');
+});
+
+test('insertTranscript puts the transcript at the caret, and leaves the caret after it', () => {
+  assert.deepEqual(insertTranscript('我们去了公园', 2, 2, '中午', 'zh-CN'), { text: '我们中午去了公园', caret: 4 });
+  assert.deepEqual(insertTranscript('后面的话', 0, 0, '前面', 'zh-CN'), { text: '前面后面的话', caret: 2 });
+  assert.deepEqual(insertTranscript('前面的话', 4, 4, '后面', 'zh-CN'), { text: '前面的话后面', caret: 6 });
+  assert.deepEqual(insertTranscript('', 0, 0, '你好', 'zh-CN'), { text: '你好', caret: 2 });
+});
+
+test('insertTranscript replaces the selected text', () => {
+  assert.deepEqual(insertTranscript('我们去了公园', 2, 4, '中午', 'zh-CN'), { text: '我们中午公园', caret: 4 });
+  assert.deepEqual(insertTranscript('go to the park', 6, 9, 'the beach', 'en-US'), { text: 'go to the beach park', caret: 15 });
+});
+
+test('insertTranscript adds one English space on each side that touches a non-space, and no spaces in Chinese', () => {
+  assert.deepEqual(insertTranscript('hello', 5, 5, 'there', 'en-US'), { text: 'hello there', caret: 11 });
+  assert.deepEqual(insertTranscript('hello world', 5, 5, 'big', 'en-US'), { text: 'hello big world', caret: 9 });
+  assert.deepEqual(insertTranscript('hello world', 6, 6, 'big', 'en-US'), { text: 'hello big world', caret: 10 });
+  assert.deepEqual(insertTranscript('abcdef', 2, 4, 'xy', 'en-US'), { text: 'ab xy ef', caret: 6 });
+  assert.deepEqual(insertTranscript('world', 0, 0, 'hello', 'en-US'), { text: 'hello world', caret: 6 });
+  assert.deepEqual(insertTranscript('hello world', 5, 5, 'big', 'zh-CN'), { text: 'hellobig world', caret: 8 });
+});
+
+test('insertTranscript trims the transcript, and an empty or blank transcript changes nothing', () => {
+  assert.deepEqual(insertTranscript('', 0, 0, '  hi there  ', 'en-US'), { text: 'hi there', caret: 8 });
+  assert.deepEqual(insertTranscript('abc', 1, 2, '', 'en-US'), { text: 'abc', caret: 2 });
+  assert.deepEqual(insertTranscript('abc', 1, 2, '   ', 'zh-CN'), { text: 'abc', caret: 2 });
+});
+
+test('dictationErrorMessage names each recognition error, and shows nothing for an aborted recognition', () => {
+  assert.equal(dictationErrorMessage('not-allowed'), 'Microphone access was denied.');
+  assert.equal(dictationErrorMessage('service-not-allowed'), 'Microphone access was denied.');
+  assert.equal(dictationErrorMessage('no-speech'), 'No speech was heard.');
+  assert.equal(dictationErrorMessage('audio-capture'), 'No microphone was found.');
+  assert.equal(dictationErrorMessage('network'), 'The speech service is unreachable.');
+  assert.equal(dictationErrorMessage('aborted'), null);
+  assert.equal(dictationErrorMessage('language-not-supported'), 'Dictation stopped: language-not-supported');
+  assert.equal(dictationErrorMessage('constructor'), 'Dictation stopped: constructor');
+});
+
+test('splitResults takes the final transcripts from resultIndex on, and the interim text that is still changing', () => {
+  const results = [
+    { isFinal: true, 0: { transcript: '我们' } },
+    { isFinal: true, 0: { transcript: '中午' } },
+    { isFinal: false, 0: { transcript: '去' } },
+  ];
+  assert.deepEqual(splitResults(results, 0), { finals: ['我们', '中午'], interim: '去' });
+  assert.deepEqual(splitResults(results, 1), { finals: ['中午'], interim: '去' });
+  assert.deepEqual(splitResults(results, 2), { finals: [], interim: '去' });
+  assert.deepEqual(splitResults([{ isFinal: false, 0: { transcript: '去' } }, { isFinal: false, 0: { transcript: '了' } }], 0), { finals: [], interim: '去了' });
+  assert.deepEqual(splitResults([], 0), { finals: [], interim: '' });
+});
+
+test('joinTranscripts trims each final transcript, joins them with a space in English and with nothing in Chinese', () => {
+  assert.equal(joinTranscripts([' hello ', 'there', ' '], 'en-US'), 'hello there');
+  assert.equal(joinTranscripts(['你好', '今天'], 'zh-CN'), '你好今天');
+  assert.equal(joinTranscripts([], 'en-US'), '');
 });
