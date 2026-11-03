@@ -91,8 +91,9 @@ async function optionalFile(form: FormData, name: string): Promise<Uint8Array<Ar
 }
 
 async function createEntry(request: Request, memories: MemoryService): Promise<Response> {
-  const { text, occurredAt, relatedIds } = await jsonBody(request, ['text', 'occurredAt', 'relatedIds']);
-  const memory = await memories.record({ kind: 'event', text, occurredAt, relatedIds } as MemoryInput);
+  const { id, text, occurredAt, relatedIds } = await jsonBody(request, ['id', 'text', 'occurredAt', 'relatedIds']);
+  // The client-chosen id is checked by the core service; a retry with the same id replays the entry.
+  const memory = await memories.record({ kind: 'event', text, occurredAt, relatedIds } as MemoryInput, id as string | undefined);
   return ok({ memory: currentMemory(memory) }, 201);
 }
 async function relatedPeople(url: URL, memories: MemoryService): Promise<Response> {

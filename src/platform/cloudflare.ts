@@ -20,12 +20,11 @@ export function createCloudflareMemory(env: { DB: D1Binding; MEDIA: R2Binding },
   return {
     ...memory,
     // Design section 4.3: forgetting a memory unlinks its photos; the photos themselves stay.
+    // If the unlink fails, this rejects and the client retries. The retry finds the memory already gone, which
+    // memory.forget reports as success, and then unlinks again; unlinkMemory is idempotent.
     async forget(id: string, expectedVersion: number): Promise<void> {
       await memory.forget(id, expectedVersion);
-      // The memory is already gone, so an unlink failure must not report the forget as failed (a retry would only conflict).
-      // A photo left with the deleted memory's ID is harmless: linking to a missing memory is refused.
-      try { await media.unlinkMemory(id); }
-      catch (error) { console.error('Photo unlink failed after memory deletion', error); }
+      await media.unlinkMemory(id);
     },
   };
 }

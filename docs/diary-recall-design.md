@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS media_memory ON media(owner, memory_id);
 CREATE UNIQUE INDEX IF NOT EXISTS media_hash ON media(owner, sha256);
 ```
 
-R2 对象键：`{owner}/{mediaId}/original`、`{owner}/{mediaId}/display`（长边 1600px）、`{owner}/{mediaId}/thumb`（长边 400px）。R2 bucket 私有，不开放公共访问。
+R2 对象键：`{owner}/{sha256}/original`、`{owner}/{sha256}/display`（长边 1600px）、`{owner}/{sha256}/thumb`（长边 400px），键由照片内容的 SHA-256 决定，同一张照片总是使用同一组键（见 4.3）。R2 bucket 私有，不开放公共访问。
 
 GPS 坐标：第一阶段不存储。展示用的 `display` / `thumb` 衍生图不带 EXIF；原图保留原始文件。
 
@@ -143,7 +143,11 @@ MCP tool 的参数是 JSON，没办法可靠地把照片二进制交给 tool，�
 
 ### 4.3 删除语义
 
-- `forget_memory`：删除日记条目时，把关联照片的 `memory_id` 置为 NULL，照片本身不删；回忆页面中这一条显示为已删除的空位。
+- `forget_memory`：删除日记条目时，把关联照片的 `memory_id` 置为 NULL，照片本身不删；回忆页面中这一条显示为已删除的空位。删除可以安全重试：先删除条目，解除关联失败时 `forget_memory` 报错；重试时条目已不存在，视为成功，并再次执行解除关联（解除关联本身是幂等的）。
+- 照片 blob 按内容寻址，R2 键为 `{owner}/{sha256}/{variant}`，`variant` 为 `original`、`display` 或 `thumb`。每次上传都写入同一组键：重复上传会补回缺失的 blob；上传中途失败留下的 blob 会被下一次上传覆盖，失败路径不再清理 blob。
+- 删除照片时先删除 R2 中的 blob，再用版本号做比较并交换删除 D1 中的元数据。中途失败后重试会完成删除；已删除的照片再次删除返回成功。
+- `/capture` 提交的日记条目携带浏览器生成的 `id`（`crypto.randomUUID()`）。内容不变的重试沿用同一个 `id`，服务端按 `id` 重放已保存的条目，因此响应丢失后的重试不会产生第二条日记；用户在重试前改了内容时换用新 `id`（服务端不会用不同内容重放同一个 `id`），此时若第一次其实已保存，会留下两条日记。删除后不保留墓碑，用同一 `id` 和内容重放会重新创建条目。
+- 本次改动不需要数据迁移：照片功能尚未部署。
 - `forget_media`（新增 MCP 工具，同时在 `/capture` 页面提供）：删除 R2 中的三个对象和 D1 中的元数据，并从所有回忆中移除对这张照片的引用。
 - 分享令牌可以随时撤销，撤销后旧链接立即返回 404。
 

@@ -15,6 +15,12 @@ function input(value: MemoryInput): Required<MemoryInput> {
   };
 }
 
+/** A stored record is a replay of a request only while it is still the first version with the same content. */
+function isReplayOf(stored: Memory, value: Required<MemoryInput>): boolean {
+  return stored.version === 1 && stored.kind === value.kind && stored.text === value.text && stored.occurredAt === value.occurredAt
+    && stored.relatedIds.length === value.relatedIds.length && stored.relatedIds.every((id, index) => id === value.relatedIds[index]);
+}
+
 /** Current content only: originalText is kept as history and never returned to clients. */
 export type CurrentMemory = Omit<Memory, 'originalText'>;
 export function currentMemory(memory: Memory): CurrentMemory {
@@ -26,13 +32,16 @@ export function createMemoryService(deps: CoreDependencies) {
   if (!deps.owner.trim()) throw new Error('Trusted owner is required');
   const { store, owner } = deps;
   return {
-    async record(value: MemoryInput): Promise<Memory> {
+    async record(value: MemoryInput, requestedId?: string): Promise<Memory> {
       const clean = input(value);
       const now = instant(deps.now());
-      const memory: Memory = { ...clean, id: identifier(deps.newId()), originalText: clean.text,
-        createdAt: now, updatedAt: now, version: 1 };
-      if (!await store.save(owner, memory, null)) throw new MemoryError('CONFLICT', 'Record ID already exists');
-      return memory;
+      const id = identifier(requestedId === undefined ? deps.newId() : requestedId);
+      const memory: Memory = { ...clean, id, originalText: clean.text, createdAt: now, updatedAt: now, version: 1 };
+      if (await store.save(owner, memory, null)) return memory;
+      // A client-chosen ID that already holds the same content is an earlier attempt at this request (for example, a retry after a lost response).
+      const stored = requestedId === undefined ? null : await store.get(owner, id);
+      if (stored && isReplayOf(stored, clean)) return stored;
+      throw new MemoryError('CONFLICT', 'Record ID already exists');
     },
     async get(id: string): Promise<Memory | null> { return store.get(owner, identifier(id)); },
     async search(query: MemoryQuery = {}): Promise<Memory[]> {
@@ -59,7 +68,16 @@ export function createMemoryService(deps: CoreDependencies) {
     },
     async forget(id: string, expectedVersion: number): Promise<void> {
       identifier(id); version(expectedVersion);
-      if (!await store.delete(owner, id, expectedVersion)) throw new MemoryError('CONFLICT', 'Record missing or changed');
+      let deleted: boolean;
+      try { deleted = await store.delete(owner, id, expectedVersion); }
+      catch (error) {
+        // A delete can commit and still fail to report it (a lost response). Only a record that is still present keeps the failure.
+        if (await store.get(owner, id)) throw error;
+        return;
+      }
+      if (deleted) return;
+      // Missing means already gone, so a repeat succeeds. Still present means the version is stale.
+      if (await store.get(owner, id)) throw new MemoryError('CONFLICT', 'Record missing or changed');
     },
   };
 }

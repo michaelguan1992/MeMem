@@ -36,8 +36,9 @@ async function snapshot() {
   const objects = (await env.MEDIA.list()).objects.map((object) => object.key).sort();
   return { memories: await count('memories'), media: await count('media'), objects };
 }
-async function objectKeys(id: string): Promise<string[]> {
-  return (await env.MEDIA.list({ prefix: `owner/${id}/` })).objects.map((object) => object.key).sort();
+/** Blob keys are content-addressed: every photo with this SHA-256 shares one set of keys. */
+async function objectKeys(digest: string): Promise<string[]> {
+  return (await env.MEDIA.list({ prefix: `owner/${digest}/` })).objects.map((object) => object.key).sort();
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -173,6 +174,32 @@ test('POST /api/entries stores an event in D1 and rejects bad bodies without wri
   expect(await count('memories')).toBe(1);
 });
 
+test('POST /api/entries with a client-chosen id replays the same entry when the response was lost', async () => {
+  await reset();
+  const auth = await signIn();
+  const body = { id: 'draft-entry-0001', text: '和 Matthew 在京都吃午饭。', occurredAt: '2026-04-02T10:00:00+09:00' };
+  const first = await SELF.fetch(jsonRequest('POST', '/api/entries', auth, body));
+  expect(first.status).toBe(201);
+  const firstBody = await json(first);
+  expect(firstBody).toMatchObject({ memory: { id: 'draft-entry-0001', version: 1 } });
+
+  // The client repeats the request with the same ID; the server answers with the same 201 body and stores nothing new.
+  const replay = await SELF.fetch(jsonRequest('POST', '/api/entries', auth, body));
+  expect(replay.status).toBe(201);
+  expect(await json(replay)).toEqual(firstBody);
+  expect(await count('memories')).toBe(1);
+  expect((await createCloudflareMemory(env, 'owner').search({ text: 'Matthew' })).map((memory) => memory.id)).toEqual(['draft-entry-0001']);
+
+  // The same ID with different content is a conflict, not an overwrite.
+  const changed = await SELF.fetch(jsonRequest('POST', '/api/entries', auth, { ...body, text: 'changed text' }));
+  expect(changed.status).toBe(409);
+  expect(await json(changed)).toEqual({ error: 'CONFLICT', message: 'Record ID already exists' });
+
+  const malformed = await SELF.fetch(jsonRequest('POST', '/api/entries', auth, { text: 'x', id: 'bad id!' }));
+  expect(malformed.status).toBe(400);
+  expect(await json(malformed)).toEqual({ error: 'INVALID_INPUT', message: 'Invalid record identifier' });
+});
+
 test('GET /api/related lists people and places only, with 200-character text and ID paging', async () => {
   await reset();
   const auth = await signIn();
@@ -222,7 +249,7 @@ test('a photo upload stores D1 metadata and three R2 objects, and every variant 
   const { id } = created.media;
   const rows = await env.DB.prepare('SELECT memory_id, content_type, bytes FROM media WHERE owner = ? AND id = ?').bind('owner', id).all();
   expect(rows.results).toEqual([{ memory_id: memoryId, content_type: 'image/jpeg', bytes: original.byteLength }]);
-  expect(await objectKeys(id)).toEqual([`owner/${id}/display`, `owner/${id}/original`, `owner/${id}/thumb`]);
+  expect(await objectKeys(created.media.sha256)).toEqual([`owner/${created.media.sha256}/display`, `owner/${created.media.sha256}/original`, `owner/${created.media.sha256}/thumb`]);
 
   for (const [variant, expected] of [['original', original], ['display', display], ['thumb', thumb]] as const) {
     const served = await SELF.fetch(request('GET', `/api/media/${id}/${variant}`, auth));
@@ -237,7 +264,7 @@ test('a photo upload stores D1 metadata and three R2 objects, and every variant 
   const listed = await json<MediaPage>(await SELF.fetch(request('GET', `/api/media?memoryId=${memoryId}`, auth)));
   expect(listed).toEqual({ items: [created.media], nextAfterId: null });
 
-  // The same original again returns the existing photo and writes nothing to R2 or D1.
+  // The same original again returns the existing photo. Its blobs are rewritten under the same keys, so no key or row is added.
   const before = await snapshot();
   const again = await upload(auth, { original: file(original, 'copy.jpg'), sha256: await sha256(original), caption: 'second copy' });
   expect(again.status).toBe(200);
@@ -296,8 +323,10 @@ test('PATCH and DELETE use compare-and-set, and DELETE removes every stored vari
   await reset();
   const auth = await signIn();
   const memoryId = await createEntry(auth, 'Kyoto');
-  const id = (await uploadPhoto(auth, { original: file(jpeg('edit')), display: file(jpeg('edit-display')), memoryId })).id;
+  const photo = await uploadPhoto(auth, { original: file(jpeg('edit')), display: file(jpeg('edit-display')), memoryId });
+  const { id } = photo;
   const path = `/api/media/${id}`;
+  expect(await objectKeys(photo.sha256)).toEqual([`owner/${photo.sha256}/display`, `owner/${photo.sha256}/original`]);
 
   const edited = await SELF.fetch(jsonRequest('PATCH', path, auth, { expectedVersion: 1, memoryId, caption: 'Kyoto, day one' }));
   expect(edited.status).toBe(200);
@@ -314,7 +343,9 @@ test('PATCH and DELETE use compare-and-set, and DELETE removes every stored vari
   const deleted = await SELF.fetch(jsonRequest('DELETE', path, auth, { expectedVersion: 2 }));
   expect(deleted.status).toBe(200);
   expect(await json(deleted)).toEqual({ deleted: true, id });
-  expect(await objectKeys(id)).toEqual([]);
+  expect(await objectKeys(photo.sha256)).toEqual([]);
+  // A repeated delete finds the photo already gone and succeeds.
+  expect((await SELF.fetch(jsonRequest('DELETE', path, auth, { expectedVersion: 2 }))).status).toBe(200);
   expect((await SELF.fetch(request('GET', `${path}/original`, auth))).status).toBe(404);
   expect((await SELF.fetch(request('GET', `${path}/display`, auth))).status).toBe(404);
 });
@@ -357,6 +388,29 @@ test('forgetting a memory unlinks its photos and keeps them readable', async () 
   expect(listed.items).toHaveLength(1);
   expect(listed.items[0]).toMatchObject({ id: photoId, memoryId: null });
   expect(await json(await SELF.fetch(request('GET', `/api/media?memoryId=${memoryId}`, auth)))).toEqual({ items: [], nextAfterId: null });
+});
+
+test('a failed photo unlink fails the forget, and a retry finishes it', async () => {
+  await reset();
+  const auth = await signIn();
+  const memoryId = await createEntry(auth, 'Kyoto');
+  const photoId = (await uploadPhoto(auth, { original: file(jpeg('retry-unlink')), memoryId })).id;
+  let failed = false;
+  // The memory row is deleted first; the first write that unlinks a photo then fails once.
+  const flaky = { prepare(sql: string) {
+    if (!failed && sql.startsWith('UPDATE media')) { failed = true; throw new Error('D1 unavailable'); }
+    return env.DB.prepare(sql);
+  } };
+  await expect(createCloudflareMemory({ DB: flaky, MEDIA: env.MEDIA }, 'owner').forget(memoryId, 1)).rejects.toThrow('D1 unavailable');
+  expect(await count('memories')).toBe(0);
+  const stillLinked = await json<MediaPage>(await SELF.fetch(request('GET', `/api/media?memoryId=${memoryId}`, auth)));
+  expect(stillLinked.items.map((item) => item.id)).toEqual([photoId]);
+
+  // The retry finds the memory already gone, which is a success, and unlinks the photo.
+  await createCloudflareMemory(env, 'owner').forget(memoryId, 1);
+  expect(await json(await SELF.fetch(request('GET', `/api/media?memoryId=${memoryId}`, auth)))).toEqual({ items: [], nextAfterId: null });
+  const listed = await json<MediaPage>(await SELF.fetch(request('GET', '/api/media', auth)));
+  expect(listed.items).toMatchObject([{ id: photoId, memoryId: null }]);
 });
 
 test('unknown routes and wrong methods get JSON errors, with Allow where it applies', async () => {

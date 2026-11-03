@@ -51,6 +51,7 @@ interface RelatedPage {
 }
 
 interface EntryBody {
+  id: string;
   text: string;
   occurredAt?: string;
   relatedIds?: string[];
@@ -76,6 +77,8 @@ interface QueueItem {
 interface CaptureState {
   busy: boolean;
   memoryId: string | null;
+  /** The entry's client-chosen ID and the request content it was minted for. */
+  draft: { id: string; content: string } | null;
   exifOffset: string | null;
   queue: QueueItem[];
   prefillRun: number;
@@ -195,7 +198,9 @@ function startCapturePage(): void {
   const savedPhotos = document.getElementById('saved-photos') as HTMLDivElement;
 
   // memoryId is set once the entry exists, so a retry of failed photos never creates a second entry.
-  const state: CaptureState = { busy: false, memoryId: null, exifOffset: null, queue: [], prefillRun: 0 };
+  // draft holds the entry's client-chosen ID. A retry with the same content resends it, so the server replays the entry;
+  // changed content gets a new ID, because the server refuses to replay an ID with different content.
+  const state: CaptureState = { busy: false, memoryId: null, draft: null, exifOffset: null, queue: [], prefillRun: 0 };
 
   function showStatus(message: string, isError: boolean): void {
     statusLine.textContent = message;
@@ -416,6 +421,7 @@ function startCapturePage(): void {
     const saved = state.queue.filter((item) => item.done);
     clearPhotos();
     state.memoryId = null;
+    state.draft = null;
     state.exifOffset = null;
     textInput.value = '';
     photosInput.value = '';
@@ -453,10 +459,13 @@ function startCapturePage(): void {
       if (state.memoryId === null) {
         const occurredAt = occurredAtValue();
         if (occurredAt === null) throw new Error('Choose a valid date and time.');
-        const body: EntryBody = { text };
-        if (occurredAt !== undefined) body.occurredAt = occurredAt;
+        const content: Omit<EntryBody, 'id'> = { text };
+        if (occurredAt !== undefined) content.occurredAt = occurredAt;
         const related = checkedIds();
-        if (related.length > 0) body.relatedIds = related;
+        if (related.length > 0) content.relatedIds = related;
+        const key = JSON.stringify(content);
+        if (state.draft === null || state.draft.content !== key) state.draft = { id: crypto.randomUUID(), content: key };
+        const body: EntryBody = { id: state.draft.id, ...content };
         const created = await api<CreatedEntry>('POST', '/api/entries', body);
         state.memoryId = created.memory.id;
       }

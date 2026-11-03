@@ -87,6 +87,71 @@ for (const [name, factory] of [
       assert.equal((await api.search()).length, 0);
     } finally { db.close(); }
   });
+  test(`${name}: a client-chosen ID replays the stored record and never duplicates it`, async () => {
+    const db = factory();
+    try {
+      const api = service(db.store);
+      const value = { kind: 'event' as const, text: 'Lunch with Matthew', occurredAt: '2026-10-09T03:00:00Z', relatedIds: ['person-1', 'person-1'] };
+      const first = await api.record(value, 'entry-1');
+      const replay = await api.record({ ...value, relatedIds: ['person-1'] }, 'entry-1');
+      assert.equal(first.id, 'entry-1');
+      assert.deepEqual(replay, first);
+      assert.deepEqual((await api.search()).map(m => m.id), ['entry-1']);
+    } finally { db.close(); }
+  });
+  test(`${name}: a client-chosen ID with different content conflicts, and so does a replay after correction`, async () => {
+    const db = factory();
+    try {
+      const api = service(db.store);
+      await api.record({ kind: 'event', text: 'Lunch', relatedIds: ['a', 'b'] }, 'entry-2');
+      await assert.rejects(api.record({ kind: 'event', text: 'Dinner', relatedIds: ['a', 'b'] }, 'entry-2'), { code: 'CONFLICT', message: 'Record ID already exists' });
+      await assert.rejects(api.record({ kind: 'event', text: 'Lunch', relatedIds: ['b', 'a'] }, 'entry-2'), { code: 'CONFLICT' });
+      assert.equal((await api.get('entry-2'))?.text, 'Lunch');
+      await api.correct('entry-2', 1, { kind: 'event', text: 'Lunch, corrected', relatedIds: ['a', 'b'] });
+      await assert.rejects(api.record({ kind: 'event', text: 'Lunch', relatedIds: ['a', 'b'] }, 'entry-2'), { code: 'CONFLICT' });
+      assert.equal((await api.search()).length, 1);
+    } finally { db.close(); }
+  });
+  test(`${name}: a replay does not call newId, and concurrent requests with one ID create one record`, async () => {
+    const db = factory();
+    try {
+      const api = createMemoryService({ store: db.store, owner: 'alice', newId: () => { throw new Error('newId must not run'); },
+        now: () => '2026-10-09T12:00:00Z' });
+      const value = { kind: 'fact' as const, text: 'Written twice at once' };
+      const [first, second] = await Promise.all([api.record(value, 'entry-3'), api.record(value, 'entry-3')]);
+      assert.equal(first.id, 'entry-3');
+      assert.deepEqual(second, first);
+      assert.equal((await api.search()).length, 1);
+    } finally { db.close(); }
+  });
+  test(`${name}: forgetting twice succeeds, while a stale version on a live record still conflicts`, async () => {
+    const db = factory();
+    try {
+      const api = service(db.store);
+      const fact = await api.record({ kind: 'fact', text: 'Forget me' });
+      await assert.rejects(api.forget(fact.id, 2), { code: 'CONFLICT' });
+      await api.forget(fact.id, 1);
+      await api.forget(fact.id, 1);
+      assert.equal(await api.get(fact.id), null);
+    } finally { db.close(); }
+  });
+  test(`${name}: forgetting succeeds after a delete that committed before its response was lost`, async () => {
+    const db = factory();
+    try {
+      const api = service(db.store);
+      const committed = await api.record({ kind: 'fact', text: 'Delete committed' });
+      const lostResponse = service({ ...db.store, async delete(owner, id, expectedVersion) {
+        await db.store.delete(owner, id, expectedVersion);
+        throw new Error('response lost');
+      } });
+      await lostResponse.forget(committed.id, 1);
+      assert.equal(await api.get(committed.id), null);
+      const kept = await api.record({ kind: 'fact', text: 'Delete never committed' });
+      const unavailable = service({ ...db.store, async delete() { throw new Error('D1 unavailable'); } });
+      await assert.rejects(unavailable.forget(kept.id, 1), /D1 unavailable/);
+      assert.equal((await api.get(kept.id))?.text, 'Delete never committed');
+    } finally { db.close(); }
+  });
 }
 
 test('SQLite records persist across reopening', async () => {

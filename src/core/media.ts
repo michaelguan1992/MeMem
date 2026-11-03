@@ -55,8 +55,8 @@ function photo(value: unknown, max: number, label: string, types: Media['content
 export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; memories: MemoryStore; owner: string; newId: () => string; now: () => string }) {
   if (!deps.owner.trim()) throw new Error('Trusted owner is required');
   const { media, blobs, memories, owner } = deps;
-  const keyOf = (id: string, variant: MediaVariant) => `${owner}/${id}/${variant}`;
-  const purge = async (keys: string[]) => { if (keys.length) await blobs.delete(keys); };
+  // Blob keys are content-addressed: one photo (owner and SHA-256) always maps to the same three keys.
+  const keyOf = (sha256: string, variant: MediaVariant) => `${owner}/${sha256}/${variant}`;
   async function linkable(value: unknown): Promise<string | null> {
     if (value == null) return null;
     const memoryId = identifier(value);
@@ -87,28 +87,18 @@ export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; 
         takenAt: input.takenAt == null ? null : instant(input.takenAt),
         width: dimension(input.width), height: dimension(input.height), caption: caption(input.caption),
       };
+      // Every attempt writes the provided parts under the photo's own keys. On a duplicate this repairs blobs lost out of
+      // band; a failed or lost attempt leaves only these keys, which the next attempt overwrites. Nothing is purged here.
+      for (const part of parts) await blobs.put(keyOf(sha256, part.variant), part.body, part.contentType);
       const [existing] = await media.list(owner, { sha256, limit: 1 });
       if (existing) return { media: existing, duplicate: true };
       const id = identifier(deps.newId());
-      // Refuse before writing: a reused ID must never overwrite another photo's blobs.
-      if (await media.get(owner, id)) throw new MemoryError('CONFLICT', 'Photo ID already exists');
       const record: Media = { ...clean, id, contentType, bytes: input.original.byteLength, sha256, createdAt: instant(deps.now()), version: 1 };
-      const written: string[] = [];
-      try {
-        for (const part of parts) {
-          const key = keyOf(id, part.variant);
-          written.push(key);
-          await blobs.put(key, part.body, part.contentType);
-        }
-        if (await media.save(owner, record, null)) return { media: record, duplicate: false };
-      } catch (error) {
-        await purge(written);
-        throw error;
-      }
-      // Lost the race for this hash (or ID): drop our blobs and report the winner.
-      await purge(written);
+      if (await media.save(owner, record, null)) return { media: record, duplicate: false };
+      // Lost the race for this hash, or the ID is taken. The winner's blobs use the same keys, so nothing is deleted.
       const [winner] = await media.list(owner, { sha256, limit: 1 });
       if (winner) return { media: winner, duplicate: true };
+      if (await media.get(owner, id)) throw new MemoryError('CONFLICT', 'Photo ID already exists');
       throw new MemoryError('CONFLICT', 'Photo changed during upload; retry');
     },
     async get(id: string): Promise<Media | null> { return media.get(owner, identifier(id)); },
@@ -134,14 +124,21 @@ export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; 
     },
     async remove(id: string, expectedVersion: number): Promise<void> {
       identifier(id); version(expectedVersion);
-      if (!await media.delete(owner, id, expectedVersion)) throw new MemoryError('CONFLICT', 'Photo missing or changed');
-      await blobs.delete(variants.map(variant => keyOf(id, variant)));
+      const item = await media.get(owner, id);
+      // Already gone: the state this call asks for already holds, so a repeat succeeds.
+      if (!item) return;
+      if (item.version !== expectedVersion) throw new MemoryError('CONFLICT', 'Photo missing or changed');
+      // Blobs go first. A crash here leaves the row, and a retry finishes the job; a reported success never leaves bytes behind.
+      await blobs.delete(variants.map(variant => keyOf(item.sha256, variant)));
+      if (await media.delete(owner, id, expectedVersion)) return;
+      // The compare-and-set lost: a row still there has changed (conflict); a row that is gone was removed meanwhile (success).
+      if (await media.get(owner, id)) throw new MemoryError('CONFLICT', 'Photo missing or changed');
     },
     async read(id: string, variant: MediaVariant): Promise<BlobObject | null> {
       identifier(id);
       if (!variants.includes(variant)) invalid('Unknown photo variant');
-      if (!await media.get(owner, id)) return null;
-      return blobs.get(keyOf(id, variant));
+      const item = await media.get(owner, id);
+      return item ? blobs.get(keyOf(item.sha256, variant)) : null;
     },
     async unlinkMemory(memoryId: string): Promise<number> {
       identifier(memoryId);

@@ -81,6 +81,20 @@ function racingStore(t: Setup, edit: Partial<Media>): MediaStore {
     },
   };
 }
+/** Lets a winning upload save its row first, so this upload's own save loses the hash race. */
+function racingInsert(t: Setup, winner: Media): MediaStore {
+  let raced = false;
+  return {
+    ...t.media,
+    async save(owner, record, expectedVersion) {
+      if (!raced && expectedVersion === null) {
+        raced = true;
+        await t.media.save(owner, winner, null);
+      }
+      return t.media.save(owner, record, expectedVersion);
+    },
+  };
+}
 
 test('JPEG upload stores normalized metadata and original, display, and thumbnail blobs', async () => {
   const t = setup();
@@ -94,8 +108,8 @@ test('JPEG upload stores normalized metadata and original, display, and thumbnai
       createdAt: '2026-10-09T12:00:00.000Z', version: 1,
     });
     assert.deepEqual(await t.media.get('alice', 'p0001'), result.media);
-    assert.deepEqual([...t.blobs.objects.keys()].sort(), ['alice/p0001/display', 'alice/p0001/original', 'alice/p0001/thumb']);
-    assert.equal(t.blobs.objects.get('alice/p0001/thumb')?.contentType, 'image/webp');
+    assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`, `alice/${sha(jpeg)}/thumb`]);
+    assert.equal(t.blobs.objects.get(`alice/${sha(jpeg)}/thumb`)?.contentType, 'image/webp');
   } finally { t.close(); }
 });
 
@@ -155,7 +169,7 @@ test('the client SHA-256 must be lowercase hex and match the original bytes', as
   } finally { t.close(); }
 });
 
-test('an identical original returns the existing photo without writing again', async () => {
+test('an identical original returns the existing photo and rewrites only its own content-keyed blobs', async () => {
   const t = setup();
   try {
     await memory(t);
@@ -180,12 +194,44 @@ test('linking to an unknown memory is rejected without writes', async () => {
   } finally { t.close(); }
 });
 
-test('a failed blob write removes the blobs already written', async () => {
-  const t = setup((key) => key.endsWith('/thumb'));
+test('a failed blob write leaves only content-keyed blobs, and the next upload of the photo completes it', async () => {
+  let failing = true;
+  const t = setup((key) => failing && key.endsWith('/thumb'));
   try {
     await assert.rejects(service(t).upload(input(jpeg, { display: jpeg, thumb: webp })), /R2 put failed/);
-    assert.equal(t.blobs.objects.size, 0);
     assert.equal(await t.media.get('alice', 'p0001'), null);
+    // Nothing purges after a failed upload; the blobs it left are the photo's own keys, which the next upload overwrites.
+    assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`]);
+    failing = false;
+    const { media: photo, duplicate } = await service(t).upload(input(jpeg, { display: jpeg, thumb: webp }));
+    assert.equal(duplicate, false);
+    assert.equal(photo.sha256, sha(jpeg));
+    assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`, `alice/${sha(jpeg)}/thumb`]);
+  } finally { t.close(); }
+});
+
+test('a duplicate upload rewrites a blob that is missing from storage', async () => {
+  const t = setup();
+  try {
+    await memory(t);
+    const api = service(t);
+    const { media: photo } = await api.upload(input(jpeg, { display: jpeg, thumb: webp, memoryId: 'trip' }));
+    t.blobs.objects.delete(`alice/${photo.sha256}/display`); // lost out of band
+    const again = await api.upload(input(jpeg, { display: jpeg, thumb: webp }));
+    assert.deepEqual(again, { media: photo, duplicate: true });
+    assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${photo.sha256}/display`, `alice/${photo.sha256}/original`, `alice/${photo.sha256}/thumb`]);
+  } finally { t.close(); }
+});
+
+test('a lost race reports the winner and deletes nothing', async () => {
+  const t = setup();
+  try {
+    const winner: Media = { id: 'winner', memoryId: null, contentType: 'image/jpeg', bytes: jpeg.byteLength, sha256: sha(jpeg),
+      takenAt: null, width: null, height: null, caption: null, createdAt: '2026-10-09T12:00:00.000Z', version: 1 };
+    // The winning upload saves its row after this upload has written its blobs.
+    const result = await service(t, 'alice', racingInsert(t, winner)).upload(input(jpeg, { display: jpeg }));
+    assert.deepEqual(result, { media: winner, duplicate: true });
+    assert.deepEqual([...t.blobs.objects.keys()].sort(), [`alice/${sha(jpeg)}/display`, `alice/${sha(jpeg)}/original`]);
   } finally { t.close(); }
 });
 
@@ -194,8 +240,8 @@ test('a reused photo ID cannot overwrite an existing photo', async () => {
   try {
     const api = service(t, 'alice', t.media, () => 'same');
     await api.upload(input(jpeg));
-    await assert.rejects(api.upload(input(png)), { code: 'CONFLICT' });
-    assert.equal(t.blobs.objects.get('alice/same/original')?.contentType, 'image/jpeg');
+    await assert.rejects(api.upload(input(png)), { code: 'CONFLICT', message: 'Photo ID already exists' });
+    assert.equal(t.blobs.objects.get(`alice/${sha(jpeg)}/original`)?.contentType, 'image/jpeg');
     assert.equal((await api.get('same'))?.sha256, sha(jpeg));
   } finally { t.close(); }
 });
@@ -210,13 +256,13 @@ test("owners cannot read, change, or remove each other's photos", async () => {
     assert.deepEqual(await bob.list(), []);
     assert.equal(await bob.read(photo.id, 'original'), null);
     await assert.rejects(bob.update(photo.id, 1, { memoryId: null, caption: 'stolen' }), { code: 'NOT_FOUND' });
-    await assert.rejects(bob.remove(photo.id, 1), { code: 'CONFLICT' });
+    await bob.remove(photo.id, 1); // bob has no such photo: nothing is removed and alice's photo stays intact
     assert.deepEqual(await alice.get(photo.id), photo);
-    assert.ok(t.blobs.objects.has(`alice/${photo.id}/original`));
+    assert.ok(t.blobs.objects.has(`alice/${photo.sha256}/original`));
     // Deduplication is per owner: bob's copy gets its own record and blob prefix.
     const copy = await bob.upload(input(jpeg));
     assert.equal(copy.duplicate, false);
-    assert.ok(t.blobs.objects.has(`bob/${copy.media.id}/original`));
+    assert.ok(t.blobs.objects.has(`bob/${copy.media.sha256}/original`));
     assert.equal((await alice.list()).length, 1);
   } finally { t.close(); }
 });
@@ -249,7 +295,50 @@ test('remove checks the version first, then deletes metadata and every blob vari
     await api.remove(photo.id, 1);
     assert.equal(await api.get(photo.id), null);
     assert.equal(t.blobs.objects.size, 0);
-    await assert.rejects(api.remove(photo.id, 1), { code: 'CONFLICT' });
+    await api.remove(photo.id, 1); // a repeat finds the photo already gone and succeeds
+  } finally { t.close(); }
+});
+
+test('removing a photo twice succeeds and leaves no blobs', async () => {
+  const t = setup();
+  try {
+    const api = service(t);
+    const { media: photo } = await api.upload(input(jpeg, { display: jpeg, thumb: webp }));
+    await api.remove(photo.id, 1);
+    await api.remove(photo.id, 1);
+    await api.remove(photo.id, 2); // a missing photo is already gone whatever version is sent
+    assert.equal(await api.get(photo.id), null);
+    assert.equal(t.blobs.objects.size, 0);
+  } finally { t.close(); }
+});
+
+test('removing with a stale version gives CONFLICT and keeps every blob', async () => {
+  const t = setup();
+  try {
+    const api = service(t);
+    const { media: photo } = await api.upload(input(jpeg, { display: jpeg, thumb: webp }));
+    await assert.rejects(api.remove(photo.id, 2), { code: 'CONFLICT' });
+    assert.equal((await api.get(photo.id))?.version, 1);
+    assert.equal(t.blobs.objects.size, 3);
+  } finally { t.close(); }
+});
+
+test('a crash after the blobs are deleted is finished by a retry', async () => {
+  const t = setup();
+  try {
+    const { media: photo } = await service(t).upload(input(jpeg, { display: jpeg }));
+    let failOnce = true;
+    // The first metadata delete fails after the blobs are gone, as if the process stopped at that point.
+    const crashing: MediaStore = { ...t.media, async delete(owner, id, expectedVersion) {
+      if (failOnce) { failOnce = false; throw new Error('D1 write failed'); }
+      return t.media.delete(owner, id, expectedVersion);
+    } };
+    await assert.rejects(service(t, 'alice', crashing).remove(photo.id, 1), /D1 write failed/);
+    assert.deepEqual(await t.media.get('alice', photo.id), photo);
+    assert.equal(t.blobs.objects.size, 0);
+    await service(t).remove(photo.id, 1);
+    assert.equal(await t.media.get('alice', photo.id), null);
+    assert.equal(t.blobs.objects.size, 0);
   } finally { t.close(); }
 });
 
