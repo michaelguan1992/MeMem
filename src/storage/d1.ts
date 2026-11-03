@@ -1,4 +1,4 @@
-import { createSqlStore } from './sql-store.ts';
+import { createSqlStore, type SqlDriver } from './sql-store.ts';
 
 /** Structural subset of a D1 binding. Provider types stay out of core. */
 export interface D1Binding {
@@ -9,8 +9,9 @@ export interface D1Binding {
     };
   };
 }
-export function createD1Store(db: D1Binding) {
-  return createSqlStore({
+/** The one D1 driver; every D1-backed table adapter composes it. */
+export function createD1Driver(db: D1Binding): SqlDriver {
+  return {
     async query(sql, args) {
       const result = await db.prepare(sql).bind(...args).all();
       if (!result.success) throw new Error('D1 read failed');
@@ -21,5 +22,8 @@ export function createD1Store(db: D1Binding) {
       if (!result.success) throw new Error('D1 write failed');
       return result.meta.changes;
     },
-  });
+  };
+}
+export function createD1Store(db: D1Binding) {
+  return createSqlStore(createD1Driver(db));
 }

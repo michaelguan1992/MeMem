@@ -1,12 +1,14 @@
 import { getOAuthProtectedResourceMetadataUrl, Server, type CallToolResult } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Memory, MemoryInput, MemoryQuery } from '../core/contracts.ts';
-import { MemoryError, type createMemoryService } from '../core/service.ts';
+import { MemoryError } from '../core/errors.ts';
+import { currentMemory, type createMemoryService } from '../core/service.ts';
+import { ID_PATTERN } from '../core/validate.ts';
 
 export const MEMORY_READ_SCOPE = 'memory:read';
 export const MEMORY_WRITE_SCOPE = 'memory:write';
 
-const idSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const idSchema = z.string().regex(ID_PATTERN);
 const instantSchema = z.string().datetime({ offset: true });
 const memoryInputSchema = z.object({
   kind: z.enum(['event', 'person', 'place', 'fact']),
@@ -105,11 +107,6 @@ type ToolDefinition = {
   securitySchemes: { type: 'oauth2'; scopes: string[] }[];
 };
 
-type PublicMemory = Omit<Memory, 'originalText'>;
-function currentMemory(value: Memory): PublicMemory {
-  const { originalText: _historicalText, ...current } = value;
-  return current;
-}
 function textResult(data: unknown, message: string): CallToolResult {
   return { content: [{ type: 'text', text: `${message}\n${JSON.stringify(data)}` }], structuredContent: data as Record<string, unknown> };
 }

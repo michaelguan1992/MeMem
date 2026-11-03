@@ -1,27 +1,8 @@
 import type { CoreDependencies, Memory, MemoryInput, MemoryKind, MemoryQuery } from './contracts.ts';
+import { MemoryError } from './errors.ts';
+import { identifier, instant, invalid, version } from './validate.ts';
 
-export class MemoryError extends Error {
-  code: 'INVALID_INPUT' | 'CONFLICT' | 'NOT_FOUND';
-  constructor(code: MemoryError['code'], message: string) {
-    super(message); this.code = code;
-  }
-}
-const invalid = (message: string): never => { throw new MemoryError('INVALID_INPUT', message); };
 const kinds = new Set(['event', 'person', 'place', 'fact']);
-function identifier(value: unknown): string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) invalid('Invalid record identifier');
-  return value as string;
-}
-function instant(value: unknown): string {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) {
-    invalid('Time must be an ISO timestamp with timezone');
-  }
-  return new Date(value as string).toISOString();
-}
-function version(value: unknown): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 1) invalid('Expected a positive record version');
-  return value as number;
-}
 function input(value: MemoryInput): Required<MemoryInput> {
   if (!value || !kinds.has(value.kind)) invalid('Unknown memory kind');
   if (typeof value.text !== 'string' || !value.text.trim() || value.text.length > 20000) invalid('Text must contain 1–20000 characters');
@@ -32,6 +13,13 @@ function input(value: MemoryInput): Required<MemoryInput> {
     occurredAt: value.occurredAt == null ? null : instant(value.occurredAt),
     relatedIds: [...new Set(links.map(identifier))],
   };
+}
+
+/** Current content only: originalText is kept as history and never returned to clients. */
+export type CurrentMemory = Omit<Memory, 'originalText'>;
+export function currentMemory(memory: Memory): CurrentMemory {
+  const { originalText: _historicalText, ...current } = memory;
+  return current;
 }
 
 export function createMemoryService(deps: CoreDependencies) {

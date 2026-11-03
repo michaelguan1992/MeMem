@@ -1,5 +1,6 @@
 import type { BlobObject, BlobStore, Media, MediaQuery, MediaStore, MemoryStore } from './contracts.ts';
-import { MemoryError } from './service.ts';
+import { MemoryError } from './errors.ts';
+import { digest, identifier, instant, invalid, toHex, version } from './validate.ts';
 
 export interface MediaUpload {
   original: Uint8Array<ArrayBuffer>;
@@ -25,25 +26,6 @@ const originalTypes: Media['contentType'][] = ['image/jpeg', 'image/heic', 'imag
 const derivedTypes: Media['contentType'][] = ['image/jpeg', 'image/webp'];
 const heifBrands = new Set(['heic', 'heix', 'mif1', 'msf1', 'hevc']);
 
-const invalid = (message: string): never => { throw new MemoryError('INVALID_INPUT', message); };
-function identifier(value: unknown): string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) invalid('Invalid record identifier');
-  return value as string;
-}
-function instant(value: unknown): string {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) {
-    invalid('Time must be an ISO timestamp with timezone');
-  }
-  return new Date(value as string).toISOString();
-}
-function version(value: unknown): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 1) invalid('Expected a positive record version');
-  return value as number;
-}
-function digest(value: unknown): string {
-  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) invalid('SHA-256 must be 64 lowercase hex characters');
-  return value as string;
-}
 function dimension(value: unknown): number | null {
   if (value == null) return null;
   if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100000) invalid('Dimensions must be integers from 1 to 100000');
@@ -69,7 +51,6 @@ function photo(value: unknown, max: number, label: string, types: Media['content
   if (!type || !types.includes(type)) invalid(`${label} has an unsupported format`);
   return type as Media['contentType'];
 }
-const hex = (buffer: ArrayBuffer): string => [...new Uint8Array(buffer)].map(byte => byte.toString(16).padStart(2, '0')).join('');
 
 export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; memories: MemoryStore; owner: string; newId: () => string; now: () => string }) {
   if (!deps.owner.trim()) throw new Error('Trusted owner is required');
@@ -97,7 +78,7 @@ export function createMediaService(deps: { media: MediaStore; blobs: BlobStore; 
     async upload(input: MediaUpload): Promise<{ media: Media; duplicate: boolean }> {
       const contentType = photo(input.original, 25 * MiB, 'Original photo', originalTypes);
       const sha256 = digest(input.sha256);
-      if (hex(await crypto.subtle.digest('SHA-256', input.original)) !== sha256) invalid('SHA-256 does not match the photo');
+      if (toHex(await crypto.subtle.digest('SHA-256', input.original)) !== sha256) invalid('SHA-256 does not match the photo');
       const parts: { variant: MediaVariant; body: Uint8Array; contentType: string }[] = [{ variant: 'original', body: input.original, contentType }];
       if (input.display != null) parts.push({ variant: 'display', body: input.display, contentType: photo(input.display, 5 * MiB, 'Display image', derivedTypes) });
       if (input.thumb != null) parts.push({ variant: 'thumb', body: input.thumb, contentType: photo(input.thumb, MiB, 'Thumbnail', derivedTypes) });

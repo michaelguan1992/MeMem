@@ -1,9 +1,11 @@
-import type { Memory, MemoryInput } from '../core/contracts.ts';
+import type { MemoryInput } from '../core/contracts.ts';
+import { MemoryError } from '../core/errors.ts';
 import type { MediaEdit, MediaVariant } from '../core/media.ts';
-import { MemoryError } from '../core/service.ts';
+import { currentMemory } from '../core/service.ts';
+import { toHex } from '../core/validate.ts';
 import type { D1Binding } from '../storage/d1.ts';
 import { createCloudflareMedia, createCloudflareMemory } from './cloudflare.ts';
-import { PayloadTooLargeError, sameOriginPost } from './http.ts';
+import { PayloadTooLargeError, readBoundedBytes, sameOriginPost } from './http.ts';
 import type { R2Binding } from './r2.ts';
 import { checkCsrf, readSession } from './web-session.ts';
 
@@ -32,7 +34,6 @@ class HttpError extends Error {
   }
 }
 const bad = (message: string): HttpError => new HttpError(400, 'INVALID_INPUT', message);
-const hex = (buffer: ArrayBuffer): string => [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 
 function fail(status: number, error: string, message?: string, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(message ? { error, message } : { error }), { status, headers: { ...jsonHeaders, ...headers } });
@@ -50,33 +51,8 @@ function errorResponse(error: unknown): Response {
   if (error instanceof PayloadTooLargeError) return fail(413, 'payload_too_large', 'Request body is too large');
   return fail(500, 'unavailable');
 }
-function publicMemory({ originalText: _historicalText, ...current }: Memory): Omit<Memory, 'originalText'> {
-  return current;
-}
 
 const mediaType = (request: Request): string | undefined => request.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
-async function readBoundedBytes(request: Request, maximumBytes: number): Promise<Uint8Array> {
-  const reader = request.body?.getReader();
-  if (!reader) return new Uint8Array(0);
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maximumBytes) {
-        await reader.cancel();
-        throw new PayloadTooLargeError();
-      }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-  return body;
-}
 function parseJson(bytes: Uint8Array): unknown {
   try { return JSON.parse(new TextDecoder().decode(bytes)); }
   catch { throw bad('Request body must be valid JSON'); }
@@ -84,8 +60,6 @@ function parseJson(bytes: Uint8Array): unknown {
 /** Accepts only the listed keys; every field is type-checked again by the core service. */
 async function jsonBody(request: Request, allowed: string[]): Promise<JsonObject> {
   if (mediaType(request) !== 'application/json') throw new HttpError(415, 'unsupported_media_type', 'Expected application/json');
-  const declared = Number(request.headers.get('Content-Length'));
-  if (Number.isFinite(declared) && declared > MAX_JSON_BYTES) throw new PayloadTooLargeError();
   const body = parseJson(await readBoundedBytes(request, MAX_JSON_BYTES));
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('Request body must be a JSON object');
   if (Object.keys(body).some((key) => !allowed.includes(key))) throw bad('Request body has an unknown field');
@@ -119,7 +93,7 @@ async function optionalFile(form: FormData, name: string): Promise<Uint8Array<Ar
 async function createEntry(request: Request, memories: MemoryService): Promise<Response> {
   const { text, occurredAt, relatedIds } = await jsonBody(request, ['text', 'occurredAt', 'relatedIds']);
   const memory = await memories.record({ kind: 'event', text, occurredAt, relatedIds } as MemoryInput);
-  return ok({ memory: publicMemory(memory) }, 201);
+  return ok({ memory: currentMemory(memory) }, 201);
 }
 async function relatedPeople(url: URL, memories: MemoryService): Promise<Response> {
   const page = await memories.search({ afterId: url.searchParams.get('afterId') || undefined, limit: RELATED_PAGE });
@@ -150,7 +124,7 @@ async function uploadMedia(request: Request, media: MediaService): Promise<Respo
     original: originalBytes,
     display: await optionalFile(form, 'display'),
     thumb: await optionalFile(form, 'thumb'),
-    sha256: textField(form, 'sha256') ?? hex(await crypto.subtle.digest('SHA-256', originalBytes)),
+    sha256: textField(form, 'sha256') ?? toHex(await crypto.subtle.digest('SHA-256', originalBytes)),
     takenAt: textField(form, 'takenAt'),
     width: integer(form, 'width'),
     height: integer(form, 'height'),
