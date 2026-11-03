@@ -242,6 +242,7 @@ function assertSameAuth(requestAuth: AuthInfo | undefined, authInfo: AuthInfo, e
 }
 
 function mcpHandlerFor(env: WorkerEnv, authInfo: AuthInfo, expectedResource: string) {
+  // corsOptions: false adds no CORS headers. OAuthProvider reflects an accepted Origin (bearer-only /mcp, no cookies); others get 403.
   return createMcpHandler(({ authInfo: requestAuth }) => {
     assertSameAuth(requestAuth, authInfo, expectedResource);
     return mcpServerFor(env, requestAuth);

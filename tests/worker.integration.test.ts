@@ -542,3 +542,45 @@ test('a grant issued to another user is refused at /mcp, even when its props nam
   expect(mcp.status).toBe(401);
   expect(await mcp.text()).toBe('Unauthorized');
 });
+
+/** A bearer token for the owner, issued through the same consent flow an MCP client uses. */
+async function issueAccessToken(requestedScopes: string[]): Promise<string> {
+  const redirectUri = 'http://127.0.0.1:43210/oauth/callback';
+  const clientId = await registerTestClient(redirectUri);
+  const attempt = await beginAuthorization(clientId, redirectUri, requestedScopes);
+  const code = await extractAuthorizationCode(await submitApproval(attempt), redirectUri, attempt.state);
+  const tokenResponse = await exchangeCode(clientId, redirectUri, code, attempt.codeVerifier);
+  expect(tokenResponse.status).toBe(200);
+  return scope((await json(tokenResponse)).access_token);
+}
+
+test('/mcp refuses an unlisted browser origin with 403, serves a loopback origin with that origin reflected, and sets no cookie', async () => {
+  const accessToken = await issueAccessToken(['memory:read', 'offline_access']);
+  const send = (headers: Record<string, string>) => {
+    const request = new Request(`${origin}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    // The MCP handler's host check needs a Host header, which the MCP client transport also sets.
+    request.headers.set('Host', new URL(request.url).host);
+    return SELF.fetch(request);
+  };
+
+  // The MCP SDK's Origin check refuses an unlisted origin before any tool runs. OAuthProvider still reflects that origin.
+  const unlisted = await send({ Authorization: `Bearer ${accessToken}`, Origin: 'https://example.com' });
+  expect(unlisted.status).toBe(403);
+  expect(await unlisted.text()).toContain('Invalid Origin: example.com');
+  expect(unlisted.headers.get('access-control-allow-origin')).toBe('https://example.com');
+  expect(unlisted.headers.get('set-cookie')).toBeNull();
+
+  const loopback = await send({ Authorization: `Bearer ${accessToken}`, Origin: 'http://localhost:3000' });
+  expect(loopback.status).toBe(200);
+  await loopback.text();
+  expect(loopback.headers.get('access-control-allow-origin')).toBe('http://localhost:3000');
+  expect(loopback.headers.get('set-cookie')).toBeNull();
+
+  const unauthenticated = await send({ Origin: 'https://example.com' });
+  expect(unauthenticated.status).toBe(401);
+  expect(unauthenticated.headers.get('set-cookie')).toBeNull();
+});
